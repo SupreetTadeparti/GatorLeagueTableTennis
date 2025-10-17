@@ -1,0 +1,54 @@
+:root {
+  --gator-blue: 228, 100%, 32%;
+  --gator-orange: 13, 96%, 53%;
+  color: #eee;
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+  margin: 0;
+  font-family: Outfit;
+}
+
+html,
+body,
+#app {
+  margin: 0;
+  height: 100%;
+  background-color: #181818;
+}
+
+.page-container {
+  display: flex;
+  flex-direction: column;
+  width: 100%;
+  padding-top: 10em;
+}
+
+.thick-btn {
+  --btn-clr: var(--gator-blue);
+  --offset: 5px;
+  border: none;
+  background-color: hsl(var(--btn-clr));
+  padding: 0.5em 1.25em;
+  border-radius: 0.5em;
+  position: relative;
+  z-index: 10;
+  cursor: pointer;
+  box-shadow: 0 var(--offset) 0
+    color-mix(in srgb, hsl(var(--btn-clr)) 80%, black);
+  transition: transform 0.1s ease-in-out, box-shadow 0.1s ease-in-out;
+}
+
+/* make thick btn look pressed while being clicked on */
+.thick-btn:active {
+  transform: translateY(var(--offset));
+  box-shadow: none;
+}
+
+.thick-btn > a {
+  text-decoration: none;
+  color: inherit;
+}
