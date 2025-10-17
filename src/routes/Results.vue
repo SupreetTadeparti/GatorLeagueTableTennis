@@ -166,8 +166,6 @@ const addMatch = async () => {
   const newRatingA = updateRating(playerA.rating, playerB.rating, winner === 0);
   const newRatingB = playerB.rating - (newRatingA - playerA.rating);
 
-  console.log(newRatingA);
-
   // Update player ratings in Firestore
   const playerARef = doc(db, "players", playerA.id);
   const playerBRef = doc(db, "players", playerB.id);
@@ -260,7 +258,7 @@ onMounted(async () => {
         <button
           class="thick-btn access-btn"
           :class="showForm ? 'cancel-btn' : 'add-btn'"
-          :disabled="false && enteredAccessCode !== updateAccessCode"
+          :disabled="enteredAccessCode !== updateAccessCode"
           @click="showForm = !showForm"
         >
           {{ showForm ? "Cancel Operation" : "Add Match Result" }}
