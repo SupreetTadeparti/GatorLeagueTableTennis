@@ -7,6 +7,8 @@ import {
   deleteDoc,
   doc,
   addDoc,
+  updateDoc,
+  query,
 } from "firebase/firestore";
 import { onMounted, ref, computed } from "vue";
 
@@ -33,15 +35,60 @@ const deleteEvent = async (eventId) => {
   if (!isAdmin.value) return;
 
   try {
-    await deleteDoc(doc(db, "events", eventId));
+    // Fetch the event document to get matchList
+    const eventDocRef = doc(db, "events", eventId);
+    const eventSnap = (await eventDocRef.get)
+      ? await eventDocRef.get()
+      : await getDocs(query(collection(db, "events")));
+
+    let matchList = [];
+
+    if (eventSnap && eventSnap.data) {
+      // Firestore v9 modular: getDoc returns a DocumentSnapshot
+      const snap = eventSnap.data ? eventSnap : null;
+      if (snap && snap.exists && snap.exists()) {
+        const data = snap.data();
+        matchList = Array.isArray(data.matchList) ? data.matchList : [];
+      }
+    } else {
+      // fallback: try to get the event doc directly
+      const eventDocSnap = await getDocs(collection(db, "events"));
+      const found = eventDocSnap.docs.find((d) => d.id === eventId);
+      if (found) {
+        const data = found.data();
+        matchList = Array.isArray(data.matchList) ? data.matchList : [];
+      }
+    }
+
+    // Delete all match documents referenced in matchList
+    for (const matchRef of matchList) {
+      try {
+        // matchRef can be a DocumentReference or a string (id)
+        let matchId = matchRef.id || matchRef;
+        if (typeof matchId === "string") {
+          await deleteDoc(doc(db, "matches", matchId));
+        }
+      } catch (err) {
+        console.error("Failed to delete match", matchRef, err);
+      }
+    }
+
+    // Now delete the event itself
+    await deleteDoc(eventDocRef);
+
     // Remove from local lists
     const removeFromList = (list) => {
       const idx = list.value.findIndex((e) => e.id === eventId);
       if (idx !== -1) list.value.splice(idx, 1);
     };
+
     removeFromList(eventList);
     removeFromList(upcomingEvents);
     removeFromList(pastEvents);
+
+    // Reindex week numbers after deletion
+    await reindexWeeks();
+    await fetchEvents();
   } catch (error) {
     console.error("Error deleting event:", error);
     alert("Failed to delete event");
@@ -62,6 +109,12 @@ const addNewEvent = async () => {
 
   // Get player list and create object with id: rating pairs and
   // assign to initial and final player rating list
+  const playersSnap = await getDocs(collection(db, "players"));
+
+  const ratings = playersSnap.docs.map((d) => {
+    const pdata = d.data();
+    return { id: d.id, rating: pdata?.rating ?? null };
+  });
 
   try {
     const nextWeek = calculateNextWeek();
@@ -69,11 +122,15 @@ const addNewEvent = async () => {
       date: dateNum,
       weekNum: nextWeek,
       matchList: [],
-      initialRatings: [],
-      finalRatings: [],
+      initialRatings: ratings,
+      finalRatings: ratings.map((r) => ({ ...r })),
     };
 
     await addDoc(collection(db, "events"), newEvent);
+
+    // After adding, reindex to ensure weeks are continuous and reflect ordering
+    await reindexWeeks();
+    await fetchEvents();
 
     // Reset form
     newEventDate.value = "";
@@ -158,6 +215,38 @@ const fetchEvents = async () => {
 
   // keep a full list as well if needed elsewhere
   eventList.value = events.slice().reverse();
+};
+
+// Recalculate weekNum for all events based on ascending eventDate order
+const reindexWeeks = async () => {
+  const all = [];
+  const qSnap = await getDocs(collection(db, "events"));
+  qSnap.forEach((docSnap) => {
+    const d = docSnap.data();
+    const eventDate = parseDateNumberToDate(d.date);
+    all.push({ id: docSnap.id, ...d, eventDate });
+  });
+
+  // sort by eventDate ascending
+  all.sort((a, b) => {
+    if (!a.eventDate) return 1;
+    if (!b.eventDate) return -1;
+    return a.eventDate - b.eventDate;
+  });
+
+  // update weekNum sequentially starting at 1
+  for (let i = 0; i < all.length; i++) {
+    const expectedWeek = i + 1;
+    const ev = all[i];
+    if (ev.weekNum !== expectedWeek) {
+      const evRef = doc(db, "events", ev.id);
+      try {
+        await updateDoc(evRef, { weekNum: expectedWeek });
+      } catch (err) {
+        console.error("Failed to update weekNum for", ev.id, err);
+      }
+    }
+  }
 };
 
 onAuthStateChanged(getAuth(), (user) => {

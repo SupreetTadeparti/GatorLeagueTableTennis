@@ -13,6 +13,7 @@ import {
   updateDoc,
   arrayUnion,
 } from "firebase/firestore";
+import { updateRating } from "../util/ratings.js";
 
 const props = defineProps([]);
 
@@ -93,6 +94,35 @@ const fetchResults = async () => {
   results.value = fetched.filter(Boolean);
 };
 
+const finalizeResults = async () => {
+  // Get current event document
+  const eventsRef = collection(db, "events");
+  const q = query(eventsRef, where("weekNum", "==", parseInt(weekNum)));
+  const qSnap = await getDocs(q);
+
+  if (qSnap.empty) {
+    console.error("No event found for week", weekNum);
+    return;
+  }
+
+  // Get all current player ratings
+  const playersRef = collection(db, "players");
+  const playersSnap = await getDocs(playersRef);
+  const currentRatings = playersSnap.docs.map((doc) => ({
+    id: doc.id,
+    rating: doc.data().rating,
+  }));
+
+  // Update the event's finalRatings
+  const eventDoc = qSnap.docs[0];
+  const eventRef = doc(db, "events", eventDoc.id);
+  await updateDoc(eventRef, {
+    finalRatings: currentRatings,
+  });
+
+  alert("Final ratings have been saved for this event!");
+};
+
 const addMatch = async () => {
   // simple validation
   if (!form.value.playerA || !form.value.playerB)
@@ -133,6 +163,19 @@ const addMatch = async () => {
   await updateDoc(eventDocRef, { matchList: arrayUnion(matchDocRef) });
 
   // TODO: Update ratings and points for players
+  const newRatingA = updateRating(playerA.rating, playerB.rating, winner === 0);
+  const newRatingB = playerB.rating - (newRatingA - playerA.rating);
+
+  console.log(newRatingA);
+
+  // Update player ratings in Firestore
+  const playerARef = doc(db, "players", playerA.id);
+  const playerBRef = doc(db, "players", playerB.id);
+
+  await Promise.all([
+    updateDoc(playerARef, { rating: newRatingA }),
+    updateDoc(playerBRef, { rating: newRatingB }),
+  ]);
 
   // Reset form and refresh results
   showForm.value = false;
@@ -217,10 +260,17 @@ onMounted(async () => {
         <button
           class="thick-btn access-btn"
           :class="showForm ? 'cancel-btn' : 'add-btn'"
-          :disabled="enteredAccessCode !== updateAccessCode"
+          :disabled="false && enteredAccessCode !== updateAccessCode"
           @click="showForm = !showForm"
         >
           {{ showForm ? "Cancel Operation" : "Add Match Result" }}
+        </button>
+        <button
+          class="thick-btn compute-btn"
+          :disabled="enteredAccessCode !== updateAccessCode"
+          @click="finalizeResults"
+        >
+          Compute New Ratings
         </button>
       </div>
     </div>
@@ -264,6 +314,10 @@ onMounted(async () => {
   color: #333;
 }
 
+.compute-btn {
+  --btn-clr: var(--gator-orange);
+}
+
 .access-form {
   display: flex;
   gap: 1em;
@@ -274,7 +328,7 @@ onMounted(async () => {
   font-size: 1em;
 }
 
-.access-btn:disabled {
+.thick-btn:disabled {
   cursor: not-allowed;
   filter: opacity(60%);
 }

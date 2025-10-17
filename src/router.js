@@ -6,6 +6,7 @@ import Schedule from "./routes/Schedule.vue";
 import Register from "./routes/Register.vue";
 import Account from "./routes/Account.vue";
 import Results from "./routes/Results.vue";
+import Ratings from "./routes/Ratings.vue";
 
 const routes = [
   { path: "/", component: Home },
@@ -14,6 +15,7 @@ const routes = [
   { path: "/register", component: Register },
   { path: "/account", component: Account },
   { path: "/results/:weekNum", component: Results },
+  { path: "/ratings/:weekNum", component: Ratings },
   { path: "/authenticate", component: Authenticate },
 ];
 
