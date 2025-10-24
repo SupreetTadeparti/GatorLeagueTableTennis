@@ -448,24 +448,21 @@ onMounted(async () => {
           placeholder="Enter Access Code"
         />
         <button
+          v-if="enteredAccessCode === updateAccessCode"
           class="thick-btn access"
           :class="showForm ? 'gray' : 'blue'"
-          :disabled="false && enteredAccessCode !== updateAccessCode"
           @click="showForm = !showForm"
         >
           {{ showForm ? "Cancel Operation" : "Add Match Result" }}
         </button>
         <button
+          v-if="enteredAccessCode === updateAccessCode"
           class="thick-btn green"
-          :disabled="false && enteredAccessCode !== updateAccessCode"
           @click="finalizeResults"
         >
           Compute New Ratings
         </button>
-        <button
-          class="thick-btn orange"
-          :disabled="false && enteredAccessCode !== updateAccessCode"
-        >
+        <button class="thick-btn orange">
           <RouterLink :to="`/ratings/${weekNum}`">New Ratings</RouterLink>
         </button>
       </div>
