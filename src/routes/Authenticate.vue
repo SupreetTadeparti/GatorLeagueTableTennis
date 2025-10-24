@@ -15,7 +15,6 @@ const authenticate = async (e) => {
     signInWithEmailAndPassword(auth, adminEmail, password.value).then(
       (userCredential) => {
         const user = userCredential.user;
-        console.log(user);
         alert(
           "Authentication successful! You now have tournament edit access."
         );
@@ -23,7 +22,7 @@ const authenticate = async (e) => {
       }
     );
   } catch (error) {
-    console.log("Authentication failed: " + error.message);
+    console.error("Authentication failed: " + error.message);
   }
 };
 </script>

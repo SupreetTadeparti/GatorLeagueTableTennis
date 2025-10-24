@@ -75,6 +75,10 @@ onMounted(() => {
   <div class="page-container">
     <h1>Ratings Update - Week {{ weekNum }}</h1>
 
+    <button class="thick-btn results-btn">
+      <RouterLink :to="`/results/${weekNum}`"> Results </RouterLink>
+    </button>
+
     <div v-if="loading" class="loading">Loading ratings data...</div>
 
     <div v-else-if="ratingData.length === 0" class="no-data">
@@ -125,7 +129,7 @@ onMounted(() => {
   flex-direction: column;
   gap: 0.5em;
   max-width: 800px;
-  margin: 0 auto;
+  /* margin: 0 auto; */
 }
 
 .table-header {
@@ -142,10 +146,6 @@ onMounted(() => {
   padding: 1em;
   border-bottom: 1px solid #ddd;
   transition: background-color 0.2s ease;
-}
-
-.table-row:hover {
-  background-color: #f5f5f5;
 }
 
 .col {
@@ -166,6 +166,12 @@ onMounted(() => {
 .negative {
   color: hsl(0, 70%, 45%);
   font-weight: bold;
+}
+
+.results-btn {
+  color: #ccc;
+  font-size: 1.1em;
+  width: max-content;
 }
 
 @media (max-width: 600px) {

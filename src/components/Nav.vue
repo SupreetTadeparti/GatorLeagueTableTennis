@@ -84,7 +84,7 @@ const props = defineProps([]);
   border-radius: 0.75em;
 
   /* Other */
-  padding: 0.75em 1em;
+  padding: 0.75em 1.5em;
   background-color: hsla(0, 0%, 50%, 0.2);
   backdrop-filter: blur(10px);
 
@@ -120,16 +120,17 @@ const props = defineProps([]);
 
 /* hamburger button styles */
 .hamburger {
-  display: none; /* shown via media query */
+  display: none;
   background: transparent;
   border: none;
-  padding: 0.5em;
-  margin-left: 1em;
   cursor: pointer;
+  border-radius: .25em;
 }
+
 .hamburger:focus {
   outline: 2px solid hsl(var(--gator-blue));
 }
+
 .hamburger .bar {
   display: block;
   width: 1.6em;
@@ -149,8 +150,7 @@ const props = defineProps([]);
 /* Small screen: hide nav items and show hamburger */
 @media (max-width: 1200px) {
   .nav-container {
-    width: calc(100% - 2em);
-    padding-right: 0.5em;
+    /* width: calc(100% - 2em); */
     gap: 0.5em;
   }
 

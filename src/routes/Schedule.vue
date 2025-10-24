@@ -267,6 +267,7 @@ const props = defineProps([]);
 <template>
   <div class="page-container">
     <div class="events-container">
+      <!-- Upcoming Events -->
       <section class="upcoming">
         <h2>Upcoming Events</h2>
         <div v-if="upcomingEvents.length === 0">No upcoming events</div>
@@ -276,12 +277,12 @@ const props = defineProps([]);
             <p>{{ stringifyDate(event.date) }} at 7 PM</p>
           </div>
           <div class="event__right">
-            <button class="event__btn thick-btn event__btn--update">
+            <button class="event__btn thick-btn">
               <RouterLink :to="`/ratings/${event.weekNum}`"
                 >Updated Ratings</RouterLink
               >
             </button>
-            <button class="event__btn thick-btn event__btn--results">
+            <button class="event__btn thick-btn">
               <RouterLink :to="`/results/${event.weekNum}`">
                 Results
               </RouterLink>
@@ -289,15 +290,16 @@ const props = defineProps([]);
             <button
               v-if="isAdmin"
               @click="deleteEvent(event.id)"
-              class="event__btn thick-btn event__btn--delete"
+              class="event__btn thick-btn red"
               title="Delete Event"
             >
-              X
+              Delete
             </button>
           </div>
         </div>
       </section>
 
+      <!-- Past Events -->
       <section class="past" v-if="pastEvents.length">
         <h2>Past Events</h2>
         <div v-for="event in pastEvents" :key="event.id" class="event">
@@ -306,12 +308,12 @@ const props = defineProps([]);
             <p>{{ stringifyDate(event.date) }} at 7 PM</p>
           </div>
           <div class="event__right">
-            <button class="event__btn thick-btn event__btn--update">
+            <button class="event__btn thick-btn">
               <RouterLink :to="`/ratings/${event.weekNum}`"
                 >Updated Ratings</RouterLink
               >
             </button>
-            <button class="event__btn thick-btn event__btn--results">
+            <button class="event__btn thick-btn">
               <RouterLink :to="`/results/${event.weekNum}`">
                 Results
               </RouterLink>
@@ -319,22 +321,22 @@ const props = defineProps([]);
             <button
               v-if="isAdmin"
               @click="deleteEvent(event.id)"
-              class="event__btn thick-btn event__btn--delete"
+              class="event__btn thick-btn red"
               title="Delete Event"
             >
-              X
+              Delete
             </button>
           </div>
         </div>
       </section>
 
+      <!-- Add Event Form -->
       <section>
-        <!-- Add Event Form -->
         <div v-if="isAdmin" class="add-event">
           <button
             v-if="!showAddForm"
             @click="showAddForm = true"
-            class="thick-btn add-btn"
+            class="thick-btn green"
           >
             Add New Event
           </button>
@@ -344,10 +346,8 @@ const props = defineProps([]);
               type="date"
               v-model="newEventDate"
             />
-            <button @click="addNewEvent" class="thick-btn save-btn">
-              Save
-            </button>
-            <button @click="showAddForm = false" class="thick-btn cancel-btn">
+            <button @click="addNewEvent" class="thick-btn green">Save</button>
+            <button @click="showAddForm = false" class="thick-btn gray">
               Cancel
             </button>
           </div>
@@ -362,6 +362,7 @@ const props = defineProps([]);
   display: flex;
   flex-direction: column;
   gap: 3em;
+  margin-bottom: 1em;
 }
 
 .events-container > section {
@@ -374,7 +375,14 @@ const props = defineProps([]);
   display: flex;
   justify-content: space-between;
   align-items: center;
-  border: 3px solid hsl(var(--gator-orange));
+  /* border: 1px solid hsl(var(--gator-orange)); */
+  background: linear-gradient(
+    90deg,
+    hsl(var(--gator-orange)),
+    hsl(var(--gator-orange), 0) 100%
+  );
+  box-shadow: 0 0 10px 0 hsl(var(--gator-orange));
+
   border-radius: 0.5em;
   padding: 1em;
 }
@@ -391,23 +399,12 @@ const props = defineProps([]);
 }
 
 .event__btn {
-  /* padding: 0.5em 1em;
-  cursor: pointer;
-  border: none; */
   font-size: 1.2em;
-  /* border-radius: 0.25em;
-  background-color: hsl(var(--gator-blue)); */
   color: #ccc;
 }
 
-.event__btn--update {
-  --btn-clr: 0, 0%, 70%;
-  color: #333;
-}
-
-.event__btn--delete {
-  --btn-clr: hsl(0, 83%, 50%);
-  --btn-clr: 0, 83%, 50%;
+.add-event {
+  margin: 0 auto;
 }
 
 .add-event .thick-btn {
@@ -426,7 +423,19 @@ const props = defineProps([]);
   border: none;
 }
 
-.cancel-btn {
-  --btn-clr: 0, 0%, 50%;
+@media (max-width: 600px) {
+  .event {
+    flex-direction: column;
+    gap: 2.5em;
+    background: linear-gradient(
+      180deg,
+      hsl(var(--gator-orange)),
+      hsl(var(--gator-orange), 0.5) 100%
+    );
+  }
+
+  .event__right {
+    flex-direction: column;
+  }
 }
 </style>

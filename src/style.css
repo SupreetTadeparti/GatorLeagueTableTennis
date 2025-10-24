@@ -1,6 +1,7 @@
 :root {
   --gator-blue: 228, 100%, 32%;
   --gator-orange: 13, 96%, 53%;
+  --gator-green: 145, 60%, 33%;
   color: #eee;
 }
 
@@ -18,6 +19,8 @@ body,
   margin: 0;
   height: 100%;
   background-color: #181818;
+  /* background-image: url("./assets/background.svg");
+  background-size: cover; */
 }
 
 .page-container {
@@ -25,8 +28,10 @@ body,
   flex-direction: column;
   width: 100%;
   padding-top: 10em;
+  padding-bottom: 2em;
 }
 
+/* Thick Button */
 .thick-btn {
   --btn-clr: var(--gator-blue);
   --offset: 5px;
@@ -42,6 +47,27 @@ body,
   transition: transform 0.1s ease-in-out, box-shadow 0.1s ease-in-out;
 }
 
+.thick-btn.blue {
+  --btn-clr: var(--gator-blue);
+}
+
+.thick-btn.orange {
+  --btn-clr: var(--gator-orange);
+}
+
+.thick-btn.green {
+  --btn-clr: var(--gator-green);
+}
+
+.thick-btn.red {
+  --btn-clr: 0, 83%, 50%;
+}
+
+.thick-btn.gray {
+  --btn-clr: 0, 0%, 50%;
+  color: #ccc;
+}
+
 /* make thick btn look pressed while being clicked on */
 .thick-btn:active {
   transform: translateY(var(--offset));
@@ -51,4 +77,10 @@ body,
 .thick-btn > a {
   text-decoration: none;
   color: inherit;
+}
+
+@media (max-width: 600px) {
+  .thick-btn {
+    padding: 0.25 1em;
+  }
 }
