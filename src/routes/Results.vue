@@ -22,7 +22,7 @@ const route = useRoute();
 const router = useRouter();
 const weekNum = route.params.weekNum;
 
-const updateAccessCode = "GLTTWeek3!";
+const updateAccessCode = "GLTTWeek4";
 
 const enteredAccessCode = ref("");
 const results = ref([]);
