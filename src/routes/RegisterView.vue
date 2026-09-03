@@ -171,7 +171,7 @@ async function submit() {
         </div>
 
         <div class="field">
-          <label for="photo">Upload photo <span class="required">*</span></label>
+          <label for="photo">Upload profile photo <span class="required">*</span></label>
           <label class="file-input" for="photo">
             <span class="file-button">Browse&hellip;</span>
             <span class="file-name">{{ file ? file.name : "No file selected." }}</span>
