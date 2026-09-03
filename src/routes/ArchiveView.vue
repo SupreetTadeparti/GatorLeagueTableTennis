@@ -1,13 +1,14 @@
 <script setup>
+import UnderConstruction from "../components/UnderConstruction.vue";
 
-const props = defineProps([])
-
+const props = defineProps([]);
 </script>
 
 <template>
-    <h1>This is the archive page</h1>
+  <UnderConstruction
+    title="Archive Page"
+    message="This page is under construction. Please check back soon."
+  />
 </template>
 
-<style scoped>
-    
-</style>
+<style scoped></style>
