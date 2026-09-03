@@ -1,0 +1,23 @@
+rules_version = '2';
+service firebase.storage {
+  match /b/{bucket}/o {
+    // Player photos: only the player (or admin) can write
+    match /playerPhotos/{uid}/{allPaths=**} {
+      allow read: if true;
+      allow write: if request.auth != null && (request.auth.uid == uid || request.auth.token.admin == true);
+    }
+
+    // Tournament/winner photos: allow admins to write, or authenticated uploads under tournamentPhotos
+    match /tournamentPhotos/{tournamentId}/{allPaths=**} {
+      allow read: if true;
+      allow write: if request.auth != null && request.auth.token.admin == true;
+    }
+    
+    // Registration photos: allow authenticated users to upload photos for their registrationId
+    match /registrationPhotos/{registrationId}/{allPaths=**} {
+      allow read: if true;
+      // Note: this rule is permissive; consider tying uploads to a Firestore registration document for stricter checks
+      allow write: if request.auth != null;
+    }
+  }
+}

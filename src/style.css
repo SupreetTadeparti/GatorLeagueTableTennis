@@ -1,0 +1,19 @@
+*, *::before, *::after {
+    box-sizing: border-box;
+    margin: 0;
+    padding: 0;
+}
+
+:root {
+    --primary-color: 13, 96%, 53%;
+}
+
+html, body {
+    font-family: "Share Tech", Gill Sans;
+    background-color: #080808;
+    color: #ddd;
+}
+
+#app {
+    padding: 0 1.25em;
+}
