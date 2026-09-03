@@ -3,7 +3,10 @@ import { ref, computed, onMounted, onUnmounted } from "vue";
 import { useRouter } from "vue-router";
 import { createRegistration } from "../firebaseHelpers";
 import { auth } from "../firebase";
-import { createUserWithEmailAndPassword, onAuthStateChanged } from "firebase/auth";
+import {
+  createUserWithEmailAndPassword,
+  onAuthStateChanged,
+} from "firebase/auth";
 
 const router = useRouter();
 
@@ -18,6 +21,8 @@ const file = ref(null);
 const uploading = ref(false);
 const success = ref(null);
 const error = ref(null);
+
+const ZELLE_NUMBER = "352-756-2685";
 
 // Track auth state so we can skip email/password if the person is already signed in
 const currentUser = ref(null);
@@ -61,7 +66,11 @@ async function submit() {
     // Create the account first if this person isn't signed in yet —
     // player registration doubles as account creation.
     if (!authUid) {
-      const credential = await createUserWithEmailAndPassword(auth, email.value, password.value);
+      const credential = await createUserWithEmailAndPassword(
+        auth,
+        email.value,
+        password.value,
+      );
       authUid = credential.user.uid;
     }
 
@@ -100,7 +109,10 @@ async function submit() {
   <div class="page">
     <div class="wrap">
       <h2>Player Registration</h2>
-      <p class="subtitle">Sign up for the Gator League and we'll add you to the next available session.</p>
+      <p class="subtitle">
+        Sign up for the Gator League and we'll add you to the next available
+        session.
+      </p>
 
       <div class="card">
         <div v-if="currentUser" class="banner">
@@ -110,11 +122,19 @@ async function submit() {
         <template v-else>
           <div class="field">
             <label for="email">Email <span class="required">*</span></label>
-            <input id="email" v-model="email" type="email" placeholder="you@example.com" autocomplete="email" />
+            <input
+              id="email"
+              v-model="email"
+              type="email"
+              placeholder="you@example.com"
+              autocomplete="email"
+            />
           </div>
 
           <div class="field">
-            <label for="password">Password <span class="required">*</span></label>
+            <label for="password"
+              >Password <span class="required">*</span></label
+            >
             <input
               id="password"
               v-model="password"
@@ -126,18 +146,34 @@ async function submit() {
         </template>
 
         <div class="field">
-          <label for="fullName">Full name <span class="required">*</span></label>
-          <input id="fullName" v-model="fullName" type="text" placeholder="Jane Doe" />
+          <label for="fullName"
+            >Full name <span class="required">*</span></label
+          >
+          <input
+            id="fullName"
+            v-model="fullName"
+            type="text"
+            placeholder="Jane Doe"
+          />
         </div>
 
         <div class="field">
-          <label for="rating">Submitted rating <span class="required">*</span></label>
-          <input id="rating" v-model="submittedRating" type="number" placeholder="e.g. 1200" />
+          <label for="rating"
+            >Submitted rating <span class="required">*</span></label
+          >
+          <input
+            id="rating"
+            v-model="submittedRating"
+            type="number"
+            placeholder="e.g. 1200"
+          />
         </div>
 
         <div class="row">
           <div class="field">
-            <label for="paymentMethod">Payment method <span class="required">*</span></label>
+            <label for="paymentMethod"
+              >Payment method <span class="required">*</span></label
+            >
             <select id="paymentMethod" v-model="claimPaymentMethod">
               <option value="zelle">Zelle</option>
               <option value="cash">Cash</option>
@@ -150,21 +186,44 @@ async function submit() {
           </div>
         </div>
 
+        <p v-if="claimPaymentMethod === 'zelle'" class="payment-hint">
+          Send Zelle payment to <strong>{{ ZELLE_NUMBER }}</strong>
+        </p>
+
         <div class="field">
           <label for="paymentNote">Payment note</label>
-          <input id="paymentNote" v-model="paymentNote" type="text" placeholder="Confirmation #, sender name, etc." />
+          <input
+            id="paymentNote"
+            v-model="paymentNote"
+            type="text"
+            placeholder="Confirmation #, sender name, etc."
+          />
         </div>
 
         <div class="field">
-          <label for="photo">Upload photo <span class="required">*</span></label>
+          <label for="photo"
+            >Upload profile photo <span class="required">*</span></label
+          >
           <label class="file-input" for="photo">
             <span class="file-button">Browse&hellip;</span>
-            <span class="file-name">{{ file ? file.name : "No file selected." }}</span>
+            <span class="file-name">{{
+              file ? file.name : "No file selected."
+            }}</span>
           </label>
-          <input id="photo" class="file-native" type="file" accept="image/*" @change="onFileChange" />
+          <input
+            id="photo"
+            class="file-native"
+            type="file"
+            accept="image/*"
+            @change="onFileChange"
+          />
         </div>
 
-        <button class="submit-btn" @click="submit" :disabled="uploading || !isFormValid">
+        <button
+          class="submit-btn"
+          @click="submit"
+          :disabled="uploading || !isFormValid"
+        >
           {{ uploading ? "Submitting…" : "Submit Registration" }}
         </button>
 
@@ -259,6 +318,21 @@ label {
   color: #e0551f;
 }
 
+.payment-hint {
+  margin: -0.6rem 0 0;
+  color: #d7dbe0;
+  font-size: 0.85rem;
+  background: rgba(224, 85, 31, 0.1);
+  border: 1px solid rgba(224, 85, 31, 0.3);
+  border-radius: 7px;
+  padding: 0.55rem 0.75rem;
+}
+
+.payment-hint strong {
+  color: #ff8a4c;
+  letter-spacing: 0.02em;
+}
+
 input[type="text"],
 input[type="number"],
 input[type="date"],
@@ -290,6 +364,11 @@ select:focus {
   outline: none;
   border-color: #e0551f;
   box-shadow: 0 0 0 3px rgba(224, 85, 31, 0.18);
+}
+
+input[type="date"]::-webkit-calendar-picker-indicator {
+  filter: invert(1);
+  cursor: pointer;
 }
 
 input::placeholder {
@@ -339,7 +418,9 @@ input::placeholder {
   font-size: 1rem;
   font-weight: 700;
   cursor: pointer;
-  transition: background 0.15s ease, opacity 0.15s ease;
+  transition:
+    background 0.15s ease,
+    opacity 0.15s ease;
 }
 
 .submit-btn:hover:not(:disabled) {

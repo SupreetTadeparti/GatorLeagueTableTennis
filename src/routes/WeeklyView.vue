@@ -1,5 +1,5 @@
 <script setup>
-import { ref, computed, onMounted } from "vue";
+import { ref, computed, onMounted, onUnmounted } from "vue";
 import { auth, db } from "../firebase";
 import { isUserAdminByEmail } from "../firebaseHelpers";
 import {
@@ -9,13 +9,18 @@ import {
   getDocs,
   doc,
   setDoc,
+  deleteDoc,
   serverTimestamp,
 } from "firebase/firestore";
 
 const tournament = ref(null);
 const loading = ref(false);
 const activeTab = ref("groups");
+// Players who are registered for this tournament (used for groups/bracket).
 const players = ref([]);
+// Every player in the system, used to resolve the logged-in user's own
+// profile even before they've joined the tournament.
+const allPlayers = ref([]);
 
 // Tournament structure
 const groups = ref([]);
@@ -28,6 +33,16 @@ const matchError = ref("");
 // Group-stage UI state
 const expandedGroups = ref({});
 const editingMatch = ref({});
+
+// Participants
+const participants = ref([]);
+const joiningTournament = ref(false);
+const leavingTournament = ref(false);
+const participantError = ref("");
+
+// Bracket reveal timing
+const now = ref(new Date());
+let nowIntervalId = null;
 
 // Permissions
 const isAdmin = ref(false);
@@ -44,6 +59,65 @@ function isMatchPlayer(match) {
 function canEditMatch(match) {
   return isAdmin.value || isMatchPlayer(match);
 }
+
+// The logged-in user's own player profile, matched the same way as
+// isMatchPlayer: either the player doc's ID or its authUid field equals
+// the Firebase Auth uid. Looked up against allPlayers (not the
+// tournament-filtered players list) so this resolves even before the
+// user has joined the tournament.
+const currentPlayer = computed(() => {
+  const uid = currentUser.value?.uid;
+  if (!uid) return null;
+  return (
+    allPlayers.value.find((p) => p.id === uid || p.authUid === uid) || null
+  );
+});
+
+const isParticipant = computed(() => {
+  if (!currentPlayer.value) return false;
+  return participants.value.some((p) => p.id === currentPlayer.value.id);
+});
+
+// Accepts a Firestore Timestamp, JS Date, epoch number, or date string.
+function toJsDate(value) {
+  if (!value) return null;
+  if (typeof value?.toDate === "function") return value.toDate();
+  if (value instanceof Date) return value;
+  if (typeof value === "number") return new Date(value);
+  if (typeof value === "string") return new Date(value);
+  return null;
+}
+
+// The bracket unlocks at 6:00 PM (local time) on the tournament's date.
+const bracketUnlockAt = computed(() => {
+  const d = toJsDate(tournament.value?.date);
+  if (!d) return null;
+  return new Date(d.getFullYear(), d.getMonth(), d.getDate(), 18, 0, 0, 0);
+});
+
+const bracketUnlockLabel = computed(() => {
+  if (!bracketUnlockAt.value) return "";
+  return bracketUnlockAt.value.toLocaleString(undefined, {
+    weekday: "long",
+    month: "long",
+    day: "numeric",
+    hour: "numeric",
+    minute: "2-digit",
+  });
+});
+
+// Admins can preview the bracket early; everyone else waits for the
+// reveal time.
+const isBracketUnlocked = computed(() => {
+  if (isAdmin.value) return true;
+  if (!bracketUnlockAt.value) return false;
+  return now.value.getTime() >= bracketUnlockAt.value.getTime();
+});
+
+// Group play and the bracket only make sense once someone has actually
+// joined. Until then, show a "hasn't started" message instead of empty
+// groups/matches.
+const hasTournamentStarted = computed(() => participants.value.length > 0);
 
 async function loadUserAuthorization() {
   const user = auth.currentUser;
@@ -66,6 +140,7 @@ async function loadActiveTournament() {
     if (snaps.docs.length > 0) {
       const t = snaps.docs[0];
       tournament.value = { id: t.id, ...t.data() };
+      await loadParticipants(tournament.value.id);
       await loadTournamentPlayers(tournament.value.id);
       generateGroups();
       generateBracket();
@@ -80,13 +155,22 @@ async function loadActiveTournament() {
 
 async function loadTournamentPlayers(tournamentId) {
   try {
-    // Fetch players who are registered for this tournament
-    // For now, fetch all players from players collection
+    // Only include players who have actually joined this tournament
+    // (see loadParticipants) — pull their full profile (rating, photo,
+    // etc.) from the top-level players collection.
     const snaps = await getDocs(collection(db, "players"));
-    players.value = snaps.docs.map((d) => ({ id: d.id, ...d.data() }));
+    allPlayers.value = snaps.docs.map((d) => ({ id: d.id, ...d.data() }));
+    refreshRegisteredPlayers();
   } catch (e) {
     console.error("loadTournamentPlayers", e);
   }
+}
+
+// Recomputes `players` (registered-only) from the already-fetched
+// allPlayers + participants lists, without another network round trip.
+function refreshRegisteredPlayers() {
+  const participantIds = new Set(participants.value.map((p) => p.id));
+  players.value = allPlayers.value.filter((p) => participantIds.has(p.id));
 }
 
 async function loadTournamentMatches(tournamentId) {
@@ -106,6 +190,78 @@ async function loadTournamentMatches(tournamentId) {
     });
   } catch (e) {
     console.error("loadTournamentMatches", e);
+  }
+}
+
+async function loadParticipants(tournamentId) {
+  try {
+    const snaps = await getDocs(
+      collection(db, "tournaments", tournamentId, "participants"),
+    );
+    participants.value = snaps.docs.map((d) => ({ id: d.id, ...d.data() }));
+  } catch (e) {
+    console.error("loadParticipants", e);
+  }
+}
+
+async function joinTournament() {
+  if (!tournament.value) return;
+  if (!currentPlayer.value) {
+    participantError.value =
+      "We couldn't find a player profile for your account.";
+    return;
+  }
+  joiningTournament.value = true;
+  participantError.value = "";
+  try {
+    await setDoc(
+      doc(
+        db,
+        "tournaments",
+        tournament.value.id,
+        "participants",
+        currentPlayer.value.id,
+      ),
+      {
+        playerId: currentPlayer.value.id,
+        playerName: currentPlayer.value.fullName || "",
+        playerPhotoUrl: currentPlayer.value.photoUrl || null,
+        teamId: null,
+      },
+    );
+    await loadParticipants(tournament.value.id);
+    refreshRegisteredPlayers();
+    generateGroups();
+    generateBracket();
+  } catch (e) {
+    participantError.value = e.message || "Unable to join the tournament.";
+  } finally {
+    joiningTournament.value = false;
+  }
+}
+
+async function leaveTournament() {
+  if (!tournament.value || !currentPlayer.value) return;
+  leavingTournament.value = true;
+  participantError.value = "";
+  try {
+    await deleteDoc(
+      doc(
+        db,
+        "tournaments",
+        tournament.value.id,
+        "participants",
+        currentPlayer.value.id,
+      ),
+    );
+    await loadParticipants(tournament.value.id);
+    refreshRegisteredPlayers();
+    generateGroups();
+    generateBracket();
+  } catch (e) {
+    participantError.value = e.message || "Unable to leave the tournament.";
+  } finally {
+    leavingTournament.value = false;
   }
 }
 
@@ -317,6 +473,15 @@ onMounted(() => {
   loadActiveTournament();
   auth.onAuthStateChanged(loadUserAuthorization);
   loadUserAuthorization();
+  // Re-check the current time periodically so the bracket unlocks on its
+  // own once 6 PM passes, without requiring a page refresh.
+  nowIntervalId = setInterval(() => {
+    now.value = new Date();
+  }, 30000);
+});
+
+onUnmounted(() => {
+  if (nowIntervalId) clearInterval(nowIntervalId);
 });
 </script>
 
@@ -343,6 +508,12 @@ onMounted(() => {
       <!-- Tabs -->
       <div class="tabs">
         <button
+          :class="{ active: activeTab === 'participants' }"
+          @click="activeTab = 'participants'"
+        >
+          Participants
+        </button>
+        <button
           :class="{ active: activeTab === 'groups' }"
           @click="activeTab = 'groups'"
         >
@@ -360,7 +531,15 @@ onMounted(() => {
       <div v-if="activeTab === 'groups'" class="tab-content">
         <h2>Group Stage</h2>
 
-        <div class="groups-container">
+        <div v-if="!hasTournamentStarted" class="not-started">
+          <h3>Tournament hasn't started</h3>
+          <p>
+            Group play will appear here once players have joined. Head to
+            the Participants tab to sign up.
+          </p>
+        </div>
+
+        <div v-else class="groups-container">
           <div v-for="group in groups" :key="group.id" class="group-card">
             <button
               type="button"
@@ -526,9 +705,98 @@ onMounted(() => {
         <p v-if="matchError" class="match-error">{{ matchError }}</p>
       </div>
 
+      <!-- Participants Tab -->
+      <div v-if="activeTab === 'participants'" class="tab-content">
+        <h2>Participants</h2>
+
+        <div class="participants-actions">
+          <p class="participants-count">
+            {{ participants.length }}
+            {{ participants.length === 1 ? "player" : "players" }} joined
+          </p>
+
+          <button
+            v-if="currentPlayer && !isParticipant"
+            type="button"
+            class="join-btn"
+            :disabled="joiningTournament"
+            @click="joinTournament"
+          >
+            {{ joiningTournament ? "Joining..." : "Join Tournament" }}
+          </button>
+
+          <button
+            v-else-if="currentPlayer && isParticipant"
+            type="button"
+            class="leave-btn"
+            :disabled="leavingTournament"
+            @click="leaveTournament"
+          >
+            {{ leavingTournament ? "Leaving..." : "Leave Tournament" }}
+          </button>
+
+          <p v-else class="participants-hint">
+            Sign in with a player profile to join this tournament.
+          </p>
+        </div>
+
+        <p v-if="participantError" class="match-error">
+          {{ participantError }}
+        </p>
+
+        <ul v-if="participants.length > 0" class="participants-list">
+          <li
+            v-for="participant in participants"
+            :key="participant.id"
+            class="participant-row"
+            :class="{
+              'is-you': currentPlayer && participant.id === currentPlayer.id,
+            }"
+          >
+            <img
+              v-if="participant.playerPhotoUrl"
+              :src="participant.playerPhotoUrl"
+              :alt="participant.playerName"
+              class="participant-avatar"
+            />
+            <span v-else class="participant-avatar participant-avatar-fallback">
+              {{ (participant.playerName || "?").charAt(0).toUpperCase() }}
+            </span>
+            <span class="participant-name">{{ participant.playerName }}</span>
+            <span
+              v-if="currentPlayer && participant.id === currentPlayer.id"
+              class="you-badge"
+              >You</span
+            >
+          </li>
+        </ul>
+
+        <p v-else class="participants-empty">
+          No one has joined yet. Be the first!
+        </p>
+      </div>
+
       <!-- Elimination Bracket Tab -->
       <div v-if="activeTab === 'bracket'" class="tab-content">
         <h2>Elimination Bracket</h2>
+
+        <div v-if="!hasTournamentStarted" class="not-started">
+          <h3>Tournament hasn't started</h3>
+          <p>
+            The bracket will appear here once players have joined. Head to
+            the Participants tab to sign up.
+          </p>
+        </div>
+
+        <div v-else-if="!isBracketUnlocked" class="bracket-locked">
+          <h3>Bracket not revealed yet</h3>
+          <p v-if="bracketUnlockLabel">
+            The bracket unlocks on {{ bracketUnlockLabel }}.
+          </p>
+          <p v-else>The bracket unlocks once the tournament date is set.</p>
+        </div>
+
+        <template v-else>
         <div class="bracket-container">
           <div v-for="(round, idx) in bracket" :key="idx" class="bracket-round">
             <h3>{{ round.name }}</h3>
@@ -656,6 +924,7 @@ onMounted(() => {
           </div>
         </div>
         <p v-if="matchError" class="match-error">{{ matchError }}</p>
+        </template>
       </div>
     </div>
   </div>
@@ -1090,6 +1359,151 @@ onMounted(() => {
   color: #ff8585;
   margin-top: 1rem;
   font-size: 0.9rem;
+}
+
+/* Participants Tab */
+.participants-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 0.75rem;
+  margin-bottom: 1.2rem;
+}
+
+.participants-count {
+  color: #b8b8b8;
+  font-size: 0.9rem;
+  margin: 0;
+}
+
+.participants-hint {
+  color: #888;
+  font-size: 0.85rem;
+  margin: 0;
+}
+
+.join-btn,
+.leave-btn {
+  flex-shrink: 0;
+  border-radius: 6px;
+  padding: 0.55rem 1.1rem;
+  font-size: 0.85rem;
+  font-weight: 700;
+  cursor: pointer;
+  transition: opacity 0.15s ease;
+}
+
+.join-btn {
+  background: hsl(var(--primary-color));
+  border: none;
+  color: #0f0f0f;
+}
+
+.join-btn:disabled,
+.leave-btn:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.join-btn:not(:disabled):hover,
+.leave-btn:not(:disabled):hover {
+  opacity: 0.85;
+}
+
+.leave-btn {
+  background: transparent;
+  border: 1px solid rgba(255, 255, 255, 0.15);
+  color: #d8d8d8;
+}
+
+.participants-list {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  max-width: 480px;
+}
+
+.participant-row {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  padding: 0.6rem 0.9rem;
+  background: rgba(255, 255, 255, 0.02);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 8px;
+}
+
+.participant-row.is-you {
+  border-color: hsl(var(--primary-color));
+  background: rgba(255, 255, 255, 0.04);
+}
+
+.participant-avatar {
+  width: 2rem;
+  height: 2rem;
+  border-radius: 50%;
+  object-fit: cover;
+  flex-shrink: 0;
+}
+
+.participant-avatar-fallback {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(255, 255, 255, 0.08);
+  color: #d8d8d8;
+  font-weight: 700;
+  font-size: 0.85rem;
+}
+
+.participant-name {
+  color: #e8e8e8;
+  font-size: 0.9rem;
+  flex: 1;
+}
+
+.you-badge {
+  flex-shrink: 0;
+  font-size: 0.7rem;
+  font-weight: 700;
+  color: hsl(var(--primary-color));
+  border: 1px solid hsl(var(--primary-color));
+  border-radius: 999px;
+  padding: 0.15rem 0.5rem;
+}
+
+.participants-empty {
+  color: #888;
+  font-size: 0.9rem;
+}
+
+/* Bracket lock state, shown until 6 PM on the tournament date */
+.bracket-locked,
+.not-started {
+  background: rgba(255, 255, 255, 0.02);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 10px;
+  padding: 2rem 1.5rem;
+  text-align: center;
+  max-width: 480px;
+}
+
+.bracket-locked h3,
+.not-started h3 {
+  color: #e8e8e8;
+  font-size: 1.1rem;
+  margin: 0 0 0.5rem;
+}
+
+.bracket-locked p,
+.not-started p {
+  color: #999;
+  font-size: 0.9rem;
+  margin: 0;
 }
 
 /* Elimination Bracket Styles */
