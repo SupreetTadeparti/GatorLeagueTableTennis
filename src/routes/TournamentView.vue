@@ -57,7 +57,14 @@ function isMatchPlayer(match) {
 }
 
 function canEditMatch(match) {
+  // Once the tournament is finished, only admins may still submit/edit
+  // results — the players themselves lose edit access.
+  if (isTournamentFinished.value) return isAdmin.value;
   return isAdmin.value || isMatchPlayer(match);
+}
+
+function pendingResultLabel() {
+  return isTournamentFinished.value ? "No result recorded" : "Awaiting result";
 }
 
 // The logged-in user's own player profile, matched the same way as
@@ -118,6 +125,88 @@ const isBracketUnlocked = computed(() => {
 // joined. Until then, show a "hasn't started" message instead of empty
 // groups/matches.
 const hasTournamentStarted = computed(() => participants.value.length > 0);
+
+// Tournament finish + rating update state
+const finishingTournament = ref(false);
+const updatingRatings = ref(false);
+const revertingRatings = ref(false);
+const ratingsError = ref("");
+
+const isTournamentFinished = computed(() => !!tournament.value?.finishedAt);
+const ratingsApplied = computed(() => !!tournament.value?.ratingsAppliedAt);
+
+// --- Rating math (as provided) ---
+const inverseLogCurve = (x, a, b) => {
+  return 1 / Math.log10(Math.pow(10, 1 / a) + x * b);
+};
+
+const updateRating = (initialRating, opponentRating, won) => {
+  let newRating = initialRating;
+
+  let ratingDiff = opponentRating - initialRating;
+  let handicapDiff = ratingDiff / 100;
+
+  // Cap the handicap difference to a maximum of 8
+  if (handicapDiff > 8) handicapDiff = 8;
+  else if (handicapDiff < -8) handicapDiff = -8;
+
+  // Calculate ERC and URC based on handicap difference
+  let ercDepConst = 0.05; // Suggested constant for ERC calculation
+  let upsetDepConst = 1.1 * 0.01; // Suggested constant for URC calculation
+  let initialErc = 9.0; // Suggested initial ERC value
+
+  let erc = inverseLogCurve(Math.abs(handicapDiff), initialErc, ercDepConst);
+  let upsetProbability =
+    inverseLogCurve(Math.abs(handicapDiff), 50.0, upsetDepConst) / 100.0;
+
+  let urc = Math.round((erc * (1 - upsetProbability)) / upsetProbability);
+
+  // Adjust rating based on match outcome
+  if (won) {
+    if (handicapDiff > 0) {
+      // Player beat higher rated player
+      newRating += urc;
+    } // Player beat lower rated player
+    else {
+      newRating += erc;
+    }
+  } else {
+    if (handicapDiff > 0) {
+      // Player lost to higher rated player
+      newRating -= erc;
+    } // Player lost to lower rated player
+    else {
+      newRating -= urc;
+    }
+  }
+
+  return Math.round(newRating);
+};
+
+// Computes each player's NET rating delta across every submitted match in
+// the tournament. Every match is evaluated against each player's frozen
+// pre-tournament rating (initialRatingsById), never against a
+// running/updated rating, so results don't depend on match order and
+// don't accumulate match-over-match.
+function computeTournamentRatingDeltas(matches, initialRatingsById) {
+  const deltas = {};
+  matches.forEach((match) => {
+    const { player1Id, player2Id, winnerPlayerId } = match;
+    if (!player1Id || !player2Id) return;
+
+    const r1 = initialRatingsById[player1Id];
+    const r2 = initialRatingsById[player2Id];
+    if (typeof r1 !== "number" || typeof r2 !== "number") return;
+
+    const player1Won = winnerPlayerId === player1Id;
+    const player1New = updateRating(r1, r2, player1Won);
+    const player2New = updateRating(r2, r1, !player1Won);
+
+    deltas[player1Id] = (deltas[player1Id] || 0) + (player1New - r1);
+    deltas[player2Id] = (deltas[player2Id] || 0) + (player2New - r2);
+  });
+  return deltas;
+}
 
 async function loadUserAuthorization() {
   const user = auth.currentUser;
@@ -227,6 +316,13 @@ async function joinTournament() {
         playerName: currentPlayer.value.fullName || "",
         playerPhotoUrl: currentPlayer.value.photoUrl || null,
         teamId: null,
+        // Frozen at join time so rating math always uses the rating the
+        // player had before this tournament, regardless of when ratings
+        // are actually applied.
+        initialRating:
+          typeof currentPlayer.value.currentRating === "number"
+            ? currentPlayer.value.currentRating
+            : null,
       },
     );
     await loadParticipants(tournament.value.id);
@@ -469,6 +565,165 @@ async function submitMatch(match) {
 
 const isActive = computed(() => tournament.value !== null);
 
+// --- Admin: finish / reopen the tournament ---
+async function finishTournament() {
+  if (!tournament.value || !isAdmin.value) return;
+  const confirmed = window.confirm(
+    "Finish this tournament? Players won't be able to submit or edit match results anymore. You can still edit results as an admin.",
+  );
+  if (!confirmed) return;
+
+  finishingTournament.value = true;
+  ratingsError.value = "";
+  try {
+    await setDoc(
+      doc(db, "tournaments", tournament.value.id),
+      { finishedAt: serverTimestamp() },
+      { merge: true },
+    );
+    tournament.value = { ...tournament.value, finishedAt: new Date() };
+  } catch (e) {
+    ratingsError.value = e.message || "Unable to finish the tournament.";
+  } finally {
+    finishingTournament.value = false;
+  }
+}
+
+async function reopenTournament() {
+  if (!tournament.value || !isAdmin.value) return;
+  const confirmed = window.confirm(
+    "Reopen this tournament? Players will be able to submit results again.",
+  );
+  if (!confirmed) return;
+
+  finishingTournament.value = true;
+  ratingsError.value = "";
+  try {
+    await setDoc(
+      doc(db, "tournaments", tournament.value.id),
+      { finishedAt: null },
+      { merge: true },
+    );
+    tournament.value = { ...tournament.value, finishedAt: null };
+  } catch (e) {
+    ratingsError.value = e.message || "Unable to reopen the tournament.";
+  } finally {
+    finishingTournament.value = false;
+  }
+}
+
+// --- Admin: apply / revert rating changes ---
+async function updatePlayerRatings() {
+  if (!tournament.value || !isAdmin.value) return;
+  const confirmed = window.confirm(
+    "Apply rating changes for every submitted match in this tournament? This updates each participant's rating.",
+  );
+  if (!confirmed) return;
+
+  updatingRatings.value = true;
+  ratingsError.value = "";
+  try {
+    const initialRatingsById = {};
+    participants.value.forEach((p) => {
+      if (typeof p.initialRating === "number") {
+        initialRatingsById[p.id] = p.initialRating;
+      }
+    });
+
+    const matchSnaps = await getDocs(
+      collection(db, "tournaments", tournament.value.id, "matches"),
+    );
+    const matches = matchSnaps.docs
+      .map((d) => d.data())
+      .filter((m) => m.status === "submitted");
+
+    const deltas = computeTournamentRatingDeltas(matches, initialRatingsById);
+    const playerIds = Object.keys(deltas);
+
+    if (playerIds.length === 0) {
+      ratingsError.value = "No submitted matches with rating data were found.";
+      return;
+    }
+
+    for (const playerId of playerIds) {
+      const previousRating = initialRatingsById[playerId];
+      const newRating = Math.round(previousRating + deltas[playerId]);
+
+      await setDoc(
+        doc(db, "players", playerId),
+        { currentRating: newRating },
+        { merge: true },
+      );
+
+      // Record exactly what changed so this can be reverted later.
+      await setDoc(
+        doc(db, "tournaments", tournament.value.id, "ratingChanges", playerId),
+        {
+          playerId,
+          previousRating,
+          newRating,
+          delta: newRating - previousRating,
+          appliedAt: serverTimestamp(),
+        },
+      );
+    }
+
+    await setDoc(
+      doc(db, "tournaments", tournament.value.id),
+      { ratingsAppliedAt: serverTimestamp() },
+      { merge: true },
+    );
+    tournament.value = { ...tournament.value, ratingsAppliedAt: new Date() };
+
+    // Refresh so the new ratings show up immediately in the Group Stage.
+    await loadTournamentPlayers(tournament.value.id);
+  } catch (e) {
+    ratingsError.value = e.message || "Unable to update player ratings.";
+  } finally {
+    updatingRatings.value = false;
+  }
+}
+
+async function revertPlayerRatings() {
+  if (!tournament.value || !isAdmin.value) return;
+  const confirmed = window.confirm(
+    "Revert the rating changes from this tournament? Every affected player's rating will be restored to what it was before this tournament. Only do this if no later tournament has already used these ratings.",
+  );
+  if (!confirmed) return;
+
+  revertingRatings.value = true;
+  ratingsError.value = "";
+  try {
+    const snaps = await getDocs(
+      collection(db, "tournaments", tournament.value.id, "ratingChanges"),
+    );
+
+    for (const d of snaps.docs) {
+      const { playerId, previousRating } = d.data();
+      if (!playerId || typeof previousRating !== "number") continue;
+      await setDoc(
+        doc(db, "players", playerId),
+        { currentRating: previousRating },
+        { merge: true },
+      );
+      await deleteDoc(d.ref);
+    }
+
+    await setDoc(
+      doc(db, "tournaments", tournament.value.id),
+      { ratingsAppliedAt: null },
+      { merge: true },
+    );
+    tournament.value = { ...tournament.value, ratingsAppliedAt: null };
+
+    await loadTournamentPlayers(tournament.value.id);
+  } catch (e) {
+    ratingsError.value = e.message || "Unable to revert rating changes.";
+  } finally {
+    revertingRatings.value = false;
+  }
+}
+
 onMounted(() => {
   loadActiveTournament();
   auth.onAuthStateChanged(loadUserAuthorization);
@@ -503,6 +758,54 @@ onUnmounted(() => {
         <h1>{{ tournament.name || "Current Tournament" }}</h1>
         <p v-if="tournament.date" class="date">{{ tournament.date }}</p>
         <p class="player-count">{{ players.length }} Players</p>
+
+        <div v-if="isAdmin" class="tournament-admin-actions">
+          <span v-if="isTournamentFinished" class="status-pill finished"
+            >Finished</span
+          >
+
+          <button
+            v-if="!isTournamentFinished"
+            type="button"
+            class="admin-action-btn finish-btn"
+            :disabled="finishingTournament"
+            @click="finishTournament"
+          >
+            {{ finishingTournament ? "Finishing..." : "Finish Tournament" }}
+          </button>
+          <button
+            v-else
+            type="button"
+            class="admin-action-btn reopen-btn"
+            :disabled="finishingTournament"
+            @click="reopenTournament"
+          >
+            {{ finishingTournament ? "Reopening..." : "Reopen Tournament" }}
+          </button>
+
+          <button
+            v-if="isTournamentFinished && !ratingsApplied"
+            type="button"
+            class="admin-action-btn ratings-btn"
+            :disabled="updatingRatings"
+            @click="updatePlayerRatings"
+          >
+            {{ updatingRatings ? "Updating Ratings..." : "Update Ratings" }}
+          </button>
+          <button
+            v-if="ratingsApplied"
+            type="button"
+            class="admin-action-btn revert-btn"
+            :disabled="revertingRatings"
+            @click="revertPlayerRatings"
+          >
+            {{ revertingRatings ? "Reverting..." : "Revert Ratings" }}
+          </button>
+        </div>
+
+        <p v-if="ratingsError" class="match-error admin-error">
+          {{ ratingsError }}
+        </p>
       </div>
 
       <!-- Tabs -->
@@ -534,8 +837,8 @@ onUnmounted(() => {
         <div v-if="!hasTournamentStarted" class="not-started">
           <h3>Tournament hasn't started</h3>
           <p>
-            Group play will appear here once players have joined. Head to
-            the Participants tab to sign up.
+            Group play will appear here once players have joined. Head to the
+            Participants tab to sign up.
           </p>
         </div>
 
@@ -632,10 +935,7 @@ onUnmounted(() => {
                   </div>
 
                   <!-- Entry / edit form: only for match participants or admins -->
-                  <div
-                    v-else-if="canEditMatch(match)"
-                    class="match-form"
-                  >
+                  <div v-else-if="canEditMatch(match)" class="match-form">
                     <div class="score-player">
                       <span class="score-player-name">{{
                         match.player1.fullName
@@ -694,7 +994,9 @@ onUnmounted(() => {
                       {{ match.player1.fullName }} vs
                       {{ match.player2.fullName }}
                     </span>
-                    <span class="pending-label">Awaiting result</span>
+                    <span class="pending-label">{{
+                      pendingResultLabel()
+                    }}</span>
                   </div>
                 </div>
               </div>
@@ -783,8 +1085,8 @@ onUnmounted(() => {
         <div v-if="!hasTournamentStarted" class="not-started">
           <h3>Tournament hasn't started</h3>
           <p>
-            The bracket will appear here once players have joined. Head to
-            the Participants tab to sign up.
+            The bracket will appear here once players have joined. Head to the
+            Participants tab to sign up.
           </p>
         </div>
 
@@ -797,133 +1099,139 @@ onUnmounted(() => {
         </div>
 
         <template v-else>
-        <div class="bracket-container">
-          <div v-for="(round, idx) in bracket" :key="idx" class="bracket-round">
-            <h3>{{ round.name }}</h3>
-            <div class="matches">
-              <template v-for="m in round.matches" :key="m.match">
-              <div
-                v-if="!m.player1 || !m.player2"
-                class="match-row bracket-match-row"
-              >
-                <div class="matchup">
-                  <div class="player">
-                    {{ m.player1?.fullName || "TBD" }}
-                  </div>
-                  <div class="vs">vs</div>
-                  <div class="player">
-                    {{ m.player2?.fullName || "TBD" }}
-                  </div>
-                </div>
-              </div>
-
-              <div v-else class="match-row bracket-match-row">
-                <!-- Completed match: compact read-only result -->
-                <div
-                  v-if="savedMatches[m.id] && !isEditingMatch(m.id)"
-                  class="match-result bracket-match-result"
-                >
-                  <span class="result-players">
-                    <span
-                      class="result-name"
-                      :class="{
-                        winner:
-                          Number(matchScore(m.id, 1)) >
-                          Number(matchScore(m.id, 2)),
-                      }"
-                      >{{ m.player1.fullName }}</span
-                    >
-                    <span class="result-score"
-                      >{{ matchScore(m.id, 1) }} –
-                      {{ matchScore(m.id, 2) }}</span
-                    >
-                    <span
-                      class="result-name"
-                      :class="{
-                        winner:
-                          Number(matchScore(m.id, 2)) >
-                          Number(matchScore(m.id, 1)),
-                      }"
-                      >{{ m.player2.fullName }}</span
-                    >
-                  </span>
-                  <button
-                    v-if="canEditMatch(m)"
-                    type="button"
-                    class="edit-btn"
-                    @click="startEditMatch(m.id)"
+          <div class="bracket-container">
+            <div
+              v-for="(round, idx) in bracket"
+              :key="idx"
+              class="bracket-round"
+            >
+              <h3>{{ round.name }}</h3>
+              <div class="matches">
+                <template v-for="m in round.matches" :key="m.match">
+                  <div
+                    v-if="!m.player1 || !m.player2"
+                    class="match-row bracket-match-row"
                   >
-                    Edit
-                  </button>
-                </div>
+                    <div class="matchup">
+                      <div class="player">
+                        {{ m.player1?.fullName || "TBD" }}
+                      </div>
+                      <div class="vs">vs</div>
+                      <div class="player">
+                        {{ m.player2?.fullName || "TBD" }}
+                      </div>
+                    </div>
+                  </div>
 
-                <!-- Entry / edit form: only for match participants or admins -->
-                <div v-else-if="canEditMatch(m)" class="match-form">
-                  <div class="score-player">
-                    <span class="score-player-name">{{
-                      m.player1.fullName
-                    }}</span>
-                    <input
-                      type="number"
-                      min="0"
-                      step="1"
-                      :value="matchScore(m.id, 1)"
-                      aria-label="Player 1 score"
-                      @input="setMatchScore(m.id, 1, $event.target.value)"
-                    />
-                  </div>
-                  <div class="score-player">
-                    <span class="score-player-name">{{
-                      m.player2.fullName
-                    }}</span>
-                    <input
-                      type="number"
-                      min="0"
-                      step="1"
-                      :value="matchScore(m.id, 2)"
-                      aria-label="Player 2 score"
-                      @input="setMatchScore(m.id, 2, $event.target.value)"
-                    />
-                  </div>
-                  <div class="match-form-actions">
-                    <button
-                      type="button"
-                      class="submit-btn"
-                      :disabled="savingMatch === m.id"
-                      @click="submitMatch(m)"
+                  <div v-else class="match-row bracket-match-row">
+                    <!-- Completed match: compact read-only result -->
+                    <div
+                      v-if="savedMatches[m.id] && !isEditingMatch(m.id)"
+                      class="match-result bracket-match-result"
                     >
-                      {{
-                        savingMatch === m.id
-                          ? "Saving..."
-                          : savedMatches[m.id]
-                            ? "Update Result"
-                            : "Submit Result"
-                      }}
-                    </button>
-                    <button
-                      v-if="savedMatches[m.id]"
-                      type="button"
-                      class="cancel-btn"
-                      @click="cancelEditMatch(m.id)"
-                    >
-                      Cancel
-                    </button>
-                  </div>
-                </div>
+                      <span class="result-players">
+                        <span
+                          class="result-name"
+                          :class="{
+                            winner:
+                              Number(matchScore(m.id, 1)) >
+                              Number(matchScore(m.id, 2)),
+                          }"
+                          >{{ m.player1.fullName }}</span
+                        >
+                        <span class="result-score"
+                          >{{ matchScore(m.id, 1) }} –
+                          {{ matchScore(m.id, 2) }}</span
+                        >
+                        <span
+                          class="result-name"
+                          :class="{
+                            winner:
+                              Number(matchScore(m.id, 2)) >
+                              Number(matchScore(m.id, 1)),
+                          }"
+                          >{{ m.player2.fullName }}</span
+                        >
+                      </span>
+                      <button
+                        v-if="canEditMatch(m)"
+                        type="button"
+                        class="edit-btn"
+                        @click="startEditMatch(m.id)"
+                      >
+                        Edit
+                      </button>
+                    </div>
 
-                <!-- Read-only placeholder for spectators before a result exists -->
-                <div v-else class="match-pending">
-                  <span class="pending-players">
-                    {{ m.player1.fullName }} vs {{ m.player2.fullName }}
-                  </span>
-                  <span class="pending-label">Awaiting result</span>
-                </div>
+                    <!-- Entry / edit form: only for match participants or admins -->
+                    <div v-else-if="canEditMatch(m)" class="match-form">
+                      <div class="score-player">
+                        <span class="score-player-name">{{
+                          m.player1.fullName
+                        }}</span>
+                        <input
+                          type="number"
+                          min="0"
+                          step="1"
+                          :value="matchScore(m.id, 1)"
+                          aria-label="Player 1 score"
+                          @input="setMatchScore(m.id, 1, $event.target.value)"
+                        />
+                      </div>
+                      <div class="score-player">
+                        <span class="score-player-name">{{
+                          m.player2.fullName
+                        }}</span>
+                        <input
+                          type="number"
+                          min="0"
+                          step="1"
+                          :value="matchScore(m.id, 2)"
+                          aria-label="Player 2 score"
+                          @input="setMatchScore(m.id, 2, $event.target.value)"
+                        />
+                      </div>
+                      <div class="match-form-actions">
+                        <button
+                          type="button"
+                          class="submit-btn"
+                          :disabled="savingMatch === m.id"
+                          @click="submitMatch(m)"
+                        >
+                          {{
+                            savingMatch === m.id
+                              ? "Saving..."
+                              : savedMatches[m.id]
+                                ? "Update Result"
+                                : "Submit Result"
+                          }}
+                        </button>
+                        <button
+                          v-if="savedMatches[m.id]"
+                          type="button"
+                          class="cancel-btn"
+                          @click="cancelEditMatch(m.id)"
+                        >
+                          Cancel
+                        </button>
+                      </div>
+                    </div>
+
+                    <!-- Read-only placeholder for spectators before a result exists -->
+                    <div v-else class="match-pending">
+                      <span class="pending-players">
+                        {{ m.player1.fullName }} vs {{ m.player2.fullName }}
+                      </span>
+                      <span class="pending-label">{{
+                        pendingResultLabel()
+                      }}</span>
+                    </div>
+                  </div>
+                </template>
               </div>
-              </template>
             </div>
           </div>
-        </div>
-        <p v-if="matchError" class="match-error">{{ matchError }}</p>
+          <p v-if="matchError" class="match-error">{{ matchError }}</p>
         </template>
       </div>
     </div>
@@ -982,6 +1290,7 @@ onUnmounted(() => {
 }
 
 .tournament-header {
+  position: relative;
   text-align: center;
   margin-bottom: 2rem;
 }
@@ -1000,6 +1309,88 @@ onUnmounted(() => {
 .tournament-header .player-count {
   color: hsl(var(--primary-color));
   font-weight: 600;
+}
+
+.tournament-admin-actions {
+  position: absolute;
+  top: 0;
+  right: 0;
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 0.5rem;
+  max-width: 260px;
+}
+
+@media (max-width: 700px) {
+  .tournament-admin-actions {
+    position: static;
+    justify-content: center;
+    max-width: none;
+    margin-top: 1rem;
+  }
+}
+
+.status-pill {
+  font-size: 0.7rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+  border-radius: 999px;
+  padding: 0.3rem 0.7rem;
+}
+
+.status-pill.finished {
+  color: #999;
+  background: rgba(255, 255, 255, 0.06);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+}
+
+.admin-action-btn {
+  flex-shrink: 0;
+  border-radius: 6px;
+  padding: 0.5rem 0.9rem;
+  font-size: 0.8rem;
+  font-weight: 700;
+  cursor: pointer;
+  transition: opacity 0.15s ease;
+  border: 1px solid transparent;
+}
+
+.admin-action-btn:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.admin-action-btn:not(:disabled):hover {
+  opacity: 0.85;
+}
+
+.finish-btn {
+  background: #d9534f;
+  color: #fff;
+}
+
+.reopen-btn {
+  background: transparent;
+  border-color: rgba(255, 255, 255, 0.15);
+  color: #d8d8d8;
+}
+
+.ratings-btn {
+  background: hsl(var(--primary-color));
+  color: #0f0f0f;
+}
+
+.revert-btn {
+  background: transparent;
+  border-color: #d9534f;
+  color: #ff8585;
+}
+
+.admin-error {
+  margin-top: 0.75rem;
 }
 
 .tabs {

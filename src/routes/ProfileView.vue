@@ -24,10 +24,10 @@ const registrationPhotoUrl = ref(null);
 
 // Adjust these thresholds to match how you want ratings to be described.
 const TIERS = [
-  { min: 1600, label: "Elite", color: "#c084fc" },
-  { min: 1400, label: "Expert", color: "#60a5fa" },
-  { min: 1200, label: "Advanced", color: "#4ade80" },
-  { min: 1000, label: "Intermediate", color: "#facc15" },
+  { min: 2200, label: "God", color: "#c084fc" },
+  { min: 1900, label: "Hacker", color: "#60a5fa" },
+  { min: 1600, label: "Pro", color: "#4ade80" },
+  { min: 1300, label: "Intermediate", color: "#facc15" },
   { min: 0, label: "Novice", color: "#9ca3ae" },
 ];
 

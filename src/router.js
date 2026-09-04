@@ -1,7 +1,7 @@
 import { createWebHistory, createRouter } from "vue-router";
 
 import HomeView from "./routes/HomeView.vue";
-import WeeklyView from "./routes/WeeklyView.vue";
+import TournamentView from "./routes/TournamentView.vue";
 import StandingsView from "./routes/StandingsView.vue";
 import ProfileView from "./routes/ProfileView.vue";
 import ArchiveView from "./routes/ArchiveView.vue";
@@ -13,7 +13,7 @@ import { isUserAdminByEmail } from "./firebaseHelpers";
 
 const routes = [
   { path: "/", component: HomeView },
-  { path: "/weekly", component: WeeklyView },
+  { path: "/tournament", component: TournamentView },
   { path: "/standings", component: StandingsView },
   { path: "/profile", component: ProfileView },
   { path: "/archive", component: ArchiveView },

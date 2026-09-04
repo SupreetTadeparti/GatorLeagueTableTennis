@@ -36,7 +36,7 @@ async function signOutUser() {
 }
 
 const navItems = [
-  { label: "Weekly", to: "/weekly" },
+  { label: "Tournament", to: "/tournament" },
   { label: "Standings", to: "/standings" },
   { label: "Archive", to: "/archive" },
   { label: "Profile", to: "/profile" },
@@ -44,7 +44,7 @@ const navItems = [
 
 const visibleNavItems = computed(() => {
   return navItems.filter((item) => {
-    if (item.label === "Profile") return !!user.value;
+    if (item.label === "Profile") return !!user.value && !isAdmin.value;
     return true;
   });
 });

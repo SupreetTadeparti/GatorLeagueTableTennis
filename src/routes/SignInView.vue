@@ -15,7 +15,7 @@ async function signInEmail() {
   loading.value = true;
   try {
     await signInWithEmailAndPassword(auth, email.value, password.value);
-    router.push("/profile");
+    router.push("/tournament");
   } catch (e) {
     error.value = e.message || String(e);
   } finally {
@@ -29,7 +29,7 @@ async function signInGoogle() {
   try {
     const provider = new GoogleAuthProvider();
     await signInWithPopup(auth, provider);
-    router.push("/profile");
+    router.push("/tournament");
   } catch (e) {
     error.value = e.message || String(e);
   } finally {
