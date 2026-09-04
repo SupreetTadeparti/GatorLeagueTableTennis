@@ -232,8 +232,8 @@ async function loadActiveTournament() {
       await loadParticipants(tournament.value.id);
       await loadTournamentPlayers(tournament.value.id);
       generateGroups();
-      generateBracket();
       await loadTournamentMatches(tournament.value.id);
+      generateBracket();
     }
   } catch (e) {
     console.error("loadActiveTournament", e);
@@ -364,18 +364,43 @@ async function leaveTournament() {
 function generateGroups() {
   const groupSize = 4;
   const numGroups = Math.ceil(players.value.length / groupSize);
-  const groupsArray = [];
 
-  for (let i = 0; i < numGroups; i++) {
-    const start = i * groupSize;
-    const end = Math.min(start + groupSize, players.value.length);
-    const groupId = String.fromCharCode(65 + i); // A, B, C, ...
-    groupsArray.push({
-      id: groupId,
-      players: players.value.slice(start, end),
-      matches: createGroupMatches(players.value.slice(start, end), groupId),
-    });
+  if (numGroups === 0) {
+    groups.value = [];
+    return;
   }
+
+  // Snake-seed by rating: sort strongest to weakest, then deal players
+  // into groups in a serpentine pattern (A,B,C,D, D,C,B,A, A,B,C,D, ...)
+  // so the strongest players are spread evenly across groups instead of
+  // all landing in group A.
+  const seeded = [...players.value].sort(
+    (a, b) => (b.currentRating || 0) - (a.currentRating || 0),
+  );
+
+  const groupsArray = Array.from({ length: numGroups }, (_, i) => ({
+    id: String.fromCharCode(65 + i), // A, B, C, ...
+    players: [],
+  }));
+
+  let groupIndex = 0;
+  let direction = 1;
+  seeded.forEach((player) => {
+    groupsArray[groupIndex].players.push(player);
+    groupIndex += direction;
+    if (groupIndex === numGroups) {
+      groupIndex = numGroups - 1;
+      direction = -1;
+    } else if (groupIndex === -1) {
+      groupIndex = 0;
+      direction = 1;
+    }
+  });
+
+  groupsArray.forEach((g) => {
+    g.matches = createGroupMatches(g.players, g.id);
+  });
+
   groups.value = groupsArray;
 
   // Default the first group open, leave the rest collapsed. Preserve any
@@ -387,25 +412,141 @@ function generateGroups() {
   });
 }
 
-function generateBracket() {
-  // Generate single-elimination bracket
-  // For testing, use 32-player default
-  const playersForBracket =
-    players.value.length > 0 ? players.value : generateTestPlayers(32);
+// True once every match in every group has a submitted result. The
+// bracket can't be meaningfully seeded before this, since it depends on
+// final group standings.
+const groupStageComplete = computed(() => {
+  if (groups.value.length === 0) return false;
+  return groups.value.every((g) => {
+    const { completed, total } = groupProgress(g);
+    return total > 0 && completed === total;
+  });
+});
 
-  bracket.value = generateBracketRounds(playersForBracket);
+// Ranks a group's players by submitted match results: wins first, then
+// point differential, then rating as a final tiebreaker.
+function groupStandings(group) {
+  const tally = {};
+  group.players.forEach((p) => {
+    tally[p.id] = {
+      player: p,
+      wins: 0,
+      losses: 0,
+      pointsFor: 0,
+      pointsAgainst: 0,
+    };
+  });
+
+  group.matches.forEach((match) => {
+    if (!savedMatches.value[match.id]) return;
+    const s1 = Number(matchScore(match.id, 1));
+    const s2 = Number(matchScore(match.id, 2));
+    const t1 = tally[match.player1.id];
+    const t2 = tally[match.player2.id];
+    if (!t1 || !t2) return;
+
+    t1.pointsFor += s1;
+    t1.pointsAgainst += s2;
+    t2.pointsFor += s2;
+    t2.pointsAgainst += s1;
+
+    if (s1 > s2) {
+      t1.wins += 1;
+      t2.losses += 1;
+    } else {
+      t2.wins += 1;
+      t1.losses += 1;
+    }
+  });
+
+  return Object.values(tally).sort((a, b) => {
+    if (b.wins !== a.wins) return b.wins - a.wins;
+    const diffA = a.pointsFor - a.pointsAgainst;
+    const diffB = b.pointsFor - b.pointsAgainst;
+    if (diffB !== diffA) return diffB - diffA;
+    return (b.player.currentRating || 0) - (a.player.currentRating || 0);
+  });
 }
 
-function generateTestPlayers(count) {
-  const testPlayers = [];
-  for (let i = 1; i <= count; i++) {
-    testPlayers.push({
-      id: `test-${i}`,
-      fullName: `Player ${i}`,
-      currentRating: 1000 + Math.random() * 500,
+// Standard single-elimination seeding order (e.g. for 8 slots:
+// 1,8,4,5,2,7,3,6) so seed 1 and seed 2 can only meet in the final,
+// seeds 1-4 can't meet before the semis, etc.
+function standardSeedOrder(size) {
+  let seeds = [1];
+  while (seeds.length < size) {
+    const roundSize = seeds.length * 2;
+    const next = [];
+    seeds.forEach((s) => {
+      next.push(s);
+      next.push(roundSize + 1 - s);
     });
+    seeds = next;
   }
-  return testPlayers;
+  return seeds;
+}
+
+// Builds the round-1 bracket slots from each group's top 2 finishers:
+// group winners seeded 1..N (strongest first), then runners-up seeded
+// N+1..2N, placed into a standard-seeded bracket (padded with byes to
+// the next power of two if needed). Includes a best-effort pass to avoid
+// pairing two players from the same group in round 1.
+function qualifiedBracketSlots() {
+  const winners = [];
+  const runnersUp = [];
+
+  groups.value.forEach((group) => {
+    const standings = groupStandings(group);
+    if (standings[0]) {
+      winners.push({ ...standings[0].player, __groupId: group.id });
+    }
+    if (standings[1]) {
+      runnersUp.push({ ...standings[1].player, __groupId: group.id });
+    }
+  });
+
+  const byStrength = (a, b) => (b.currentRating || 0) - (a.currentRating || 0);
+  winners.sort(byStrength);
+  runnersUp.sort(byStrength);
+
+  const overallSeeds = [...winners, ...runnersUp];
+  if (overallSeeds.length === 0) return [];
+
+  let bracketSize = 1;
+  while (bracketSize < overallSeeds.length) bracketSize *= 2;
+
+  const order = standardSeedOrder(bracketSize);
+  const slots = new Array(bracketSize).fill(null);
+  overallSeeds.forEach((player, idx) => {
+    const seedNumber = idx + 1;
+    slots[order.indexOf(seedNumber)] = player;
+  });
+
+  // Best-effort same-group avoidance for round 1 pairings.
+  for (let i = 0; i < slots.length; i += 2) {
+    const a = slots[i];
+    const b = slots[i + 1];
+    if (a && b && a.__groupId === b.__groupId) {
+      for (let j = i + 2; j < slots.length; j += 2) {
+        const c = slots[j];
+        if (c && c.__groupId !== a.__groupId) {
+          slots[i + 1] = c;
+          slots[j] = b;
+          break;
+        }
+      }
+    }
+  }
+
+  return slots;
+}
+
+function generateBracket() {
+  if (!groupStageComplete.value) {
+    bracket.value = [];
+    return;
+  }
+  const slots = qualifiedBracketSlots();
+  bracket.value = slots.length > 0 ? generateBracketRounds(slots) : [];
 }
 
 function generateBracketRounds(playersList) {
@@ -556,6 +697,10 @@ async function submitMatch(match) {
     );
     savedMatches.value[match.id] = true;
     editingMatch.value[match.id] = false;
+    // A group-stage result can complete the group stage (or change a
+    // group's standings before it's complete); re-derive the bracket so
+    // it reflects the latest qualifiers.
+    generateBracket();
   } catch (error) {
     matchError.value = error.message || "Unable to save this result.";
   } finally {
@@ -641,7 +786,8 @@ async function updatePlayerRatings() {
     const playerIds = Object.keys(deltas);
 
     if (playerIds.length === 0) {
-      ratingsError.value = "No submitted matches with rating data were found.";
+      ratingsError.value =
+        "No submitted matches with rating data were found.";
       return;
     }
 
@@ -657,7 +803,13 @@ async function updatePlayerRatings() {
 
       // Record exactly what changed so this can be reverted later.
       await setDoc(
-        doc(db, "tournaments", tournament.value.id, "ratingChanges", playerId),
+        doc(
+          db,
+          "tournaments",
+          tournament.value.id,
+          "ratingChanges",
+          playerId,
+        ),
         {
           playerId,
           previousRating,
@@ -811,16 +963,16 @@ onUnmounted(() => {
       <!-- Tabs -->
       <div class="tabs">
         <button
-          :class="{ active: activeTab === 'participants' }"
-          @click="activeTab = 'participants'"
-        >
-          Participants
-        </button>
-        <button
           :class="{ active: activeTab === 'groups' }"
           @click="activeTab = 'groups'"
         >
           Group Stage
+        </button>
+        <button
+          :class="{ active: activeTab === 'participants' }"
+          @click="activeTab = 'participants'"
+        >
+          Participants
         </button>
         <button
           :class="{ active: activeTab === 'bracket' }"
@@ -837,8 +989,8 @@ onUnmounted(() => {
         <div v-if="!hasTournamentStarted" class="not-started">
           <h3>Tournament hasn't started</h3>
           <p>
-            Group play will appear here once players have joined. Head to the
-            Participants tab to sign up.
+            Group play will appear here once players have joined. Head to
+            the Participants tab to sign up.
           </p>
         </div>
 
@@ -935,7 +1087,10 @@ onUnmounted(() => {
                   </div>
 
                   <!-- Entry / edit form: only for match participants or admins -->
-                  <div v-else-if="canEditMatch(match)" class="match-form">
+                  <div
+                    v-else-if="canEditMatch(match)"
+                    class="match-form"
+                  >
                     <div class="score-player">
                       <span class="score-player-name">{{
                         match.player1.fullName
@@ -994,9 +1149,7 @@ onUnmounted(() => {
                       {{ match.player1.fullName }} vs
                       {{ match.player2.fullName }}
                     </span>
-                    <span class="pending-label">{{
-                      pendingResultLabel()
-                    }}</span>
+                    <span class="pending-label">{{ pendingResultLabel() }}</span>
                   </div>
                 </div>
               </div>
@@ -1085,8 +1238,16 @@ onUnmounted(() => {
         <div v-if="!hasTournamentStarted" class="not-started">
           <h3>Tournament hasn't started</h3>
           <p>
-            The bracket will appear here once players have joined. Head to the
-            Participants tab to sign up.
+            The bracket will appear here once players have joined. Head to
+            the Participants tab to sign up.
+          </p>
+        </div>
+
+        <div v-else-if="!groupStageComplete" class="bracket-locked">
+          <h3>Group stage still in progress</h3>
+          <p>
+            The bracket is seeded from each group's top 2 finishers once
+            every group match has been reported.
           </p>
         </div>
 
@@ -1099,139 +1260,133 @@ onUnmounted(() => {
         </div>
 
         <template v-else>
-          <div class="bracket-container">
-            <div
-              v-for="(round, idx) in bracket"
-              :key="idx"
-              class="bracket-round"
-            >
-              <h3>{{ round.name }}</h3>
-              <div class="matches">
-                <template v-for="m in round.matches" :key="m.match">
-                  <div
-                    v-if="!m.player1 || !m.player2"
-                    class="match-row bracket-match-row"
-                  >
-                    <div class="matchup">
-                      <div class="player">
-                        {{ m.player1?.fullName || "TBD" }}
-                      </div>
-                      <div class="vs">vs</div>
-                      <div class="player">
-                        {{ m.player2?.fullName || "TBD" }}
-                      </div>
-                    </div>
+        <div class="bracket-container">
+          <div v-for="(round, idx) in bracket" :key="idx" class="bracket-round">
+            <h3>{{ round.name }}</h3>
+            <div class="matches">
+              <template v-for="m in round.matches" :key="m.match">
+              <div
+                v-if="!m.player1 || !m.player2"
+                class="match-row bracket-match-row"
+              >
+                <div class="matchup">
+                  <div class="player">
+                    {{ m.player1?.fullName || "TBD" }}
                   </div>
-
-                  <div v-else class="match-row bracket-match-row">
-                    <!-- Completed match: compact read-only result -->
-                    <div
-                      v-if="savedMatches[m.id] && !isEditingMatch(m.id)"
-                      class="match-result bracket-match-result"
-                    >
-                      <span class="result-players">
-                        <span
-                          class="result-name"
-                          :class="{
-                            winner:
-                              Number(matchScore(m.id, 1)) >
-                              Number(matchScore(m.id, 2)),
-                          }"
-                          >{{ m.player1.fullName }}</span
-                        >
-                        <span class="result-score"
-                          >{{ matchScore(m.id, 1) }} –
-                          {{ matchScore(m.id, 2) }}</span
-                        >
-                        <span
-                          class="result-name"
-                          :class="{
-                            winner:
-                              Number(matchScore(m.id, 2)) >
-                              Number(matchScore(m.id, 1)),
-                          }"
-                          >{{ m.player2.fullName }}</span
-                        >
-                      </span>
-                      <button
-                        v-if="canEditMatch(m)"
-                        type="button"
-                        class="edit-btn"
-                        @click="startEditMatch(m.id)"
-                      >
-                        Edit
-                      </button>
-                    </div>
-
-                    <!-- Entry / edit form: only for match participants or admins -->
-                    <div v-else-if="canEditMatch(m)" class="match-form">
-                      <div class="score-player">
-                        <span class="score-player-name">{{
-                          m.player1.fullName
-                        }}</span>
-                        <input
-                          type="number"
-                          min="0"
-                          step="1"
-                          :value="matchScore(m.id, 1)"
-                          aria-label="Player 1 score"
-                          @input="setMatchScore(m.id, 1, $event.target.value)"
-                        />
-                      </div>
-                      <div class="score-player">
-                        <span class="score-player-name">{{
-                          m.player2.fullName
-                        }}</span>
-                        <input
-                          type="number"
-                          min="0"
-                          step="1"
-                          :value="matchScore(m.id, 2)"
-                          aria-label="Player 2 score"
-                          @input="setMatchScore(m.id, 2, $event.target.value)"
-                        />
-                      </div>
-                      <div class="match-form-actions">
-                        <button
-                          type="button"
-                          class="submit-btn"
-                          :disabled="savingMatch === m.id"
-                          @click="submitMatch(m)"
-                        >
-                          {{
-                            savingMatch === m.id
-                              ? "Saving..."
-                              : savedMatches[m.id]
-                                ? "Update Result"
-                                : "Submit Result"
-                          }}
-                        </button>
-                        <button
-                          v-if="savedMatches[m.id]"
-                          type="button"
-                          class="cancel-btn"
-                          @click="cancelEditMatch(m.id)"
-                        >
-                          Cancel
-                        </button>
-                      </div>
-                    </div>
-
-                    <!-- Read-only placeholder for spectators before a result exists -->
-                    <div v-else class="match-pending">
-                      <span class="pending-players">
-                        {{ m.player1.fullName }} vs {{ m.player2.fullName }}
-                      </span>
-                      <span class="pending-label">{{
-                        pendingResultLabel()
-                      }}</span>
-                    </div>
+                  <div class="vs">vs</div>
+                  <div class="player">
+                    {{ m.player2?.fullName || "TBD" }}
                   </div>
-                </template>
+                </div>
               </div>
+
+              <div v-else class="match-row bracket-match-row">
+                <!-- Completed match: compact read-only result -->
+                <div
+                  v-if="savedMatches[m.id] && !isEditingMatch(m.id)"
+                  class="match-result bracket-match-result"
+                >
+                  <span class="result-players">
+                    <span
+                      class="result-name"
+                      :class="{
+                        winner:
+                          Number(matchScore(m.id, 1)) >
+                          Number(matchScore(m.id, 2)),
+                      }"
+                      >{{ m.player1.fullName }}</span
+                    >
+                    <span class="result-score"
+                      >{{ matchScore(m.id, 1) }} –
+                      {{ matchScore(m.id, 2) }}</span
+                    >
+                    <span
+                      class="result-name"
+                      :class="{
+                        winner:
+                          Number(matchScore(m.id, 2)) >
+                          Number(matchScore(m.id, 1)),
+                      }"
+                      >{{ m.player2.fullName }}</span
+                    >
+                  </span>
+                  <button
+                    v-if="canEditMatch(m)"
+                    type="button"
+                    class="edit-btn"
+                    @click="startEditMatch(m.id)"
+                  >
+                    Edit
+                  </button>
+                </div>
+
+                <!-- Entry / edit form: only for match participants or admins -->
+                <div v-else-if="canEditMatch(m)" class="match-form">
+                  <div class="score-player">
+                    <span class="score-player-name">{{
+                      m.player1.fullName
+                    }}</span>
+                    <input
+                      type="number"
+                      min="0"
+                      step="1"
+                      :value="matchScore(m.id, 1)"
+                      aria-label="Player 1 score"
+                      @input="setMatchScore(m.id, 1, $event.target.value)"
+                    />
+                  </div>
+                  <div class="score-player">
+                    <span class="score-player-name">{{
+                      m.player2.fullName
+                    }}</span>
+                    <input
+                      type="number"
+                      min="0"
+                      step="1"
+                      :value="matchScore(m.id, 2)"
+                      aria-label="Player 2 score"
+                      @input="setMatchScore(m.id, 2, $event.target.value)"
+                    />
+                  </div>
+                  <div class="match-form-actions">
+                    <button
+                      type="button"
+                      class="submit-btn"
+                      :disabled="savingMatch === m.id"
+                      @click="submitMatch(m)"
+                    >
+                      {{
+                        savingMatch === m.id
+                          ? "Saving..."
+                          : savedMatches[m.id]
+                            ? "Update Result"
+                            : "Submit Result"
+                      }}
+                    </button>
+                    <button
+                      v-if="savedMatches[m.id]"
+                      type="button"
+                      class="cancel-btn"
+                      @click="cancelEditMatch(m.id)"
+                    >
+                      Cancel
+                    </button>
+                  </div>
+                </div>
+
+                <!-- Read-only placeholder for spectators before a result exists -->
+                <div v-else class="match-pending">
+                  <span class="pending-players">
+                    {{ m.player1.fullName }} vs {{ m.player2.fullName }}
+                  </span>
+                  <span class="pending-label">{{ pendingResultLabel() }}</span>
+                </div>
+              </div>
+              </template>
             </div>
           </div>
-          <p v-if="matchError" class="match-error">{{ matchError }}</p>
+        </div>
+        <p v-if="matchError" class="match-error">{{ matchError }}</p>
         </template>
       </div>
     </div>
@@ -1967,3 +2122,4 @@ onUnmounted(() => {
   padding: 0.2rem 0;
 }
 </style>
+
