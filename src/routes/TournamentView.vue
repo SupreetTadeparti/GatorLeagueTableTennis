@@ -124,14 +124,20 @@ const isBracketUnlocked = computed(() => {
 // Group play and the bracket only make sense once someone has actually
 // joined. Until then, show a "hasn't started" message instead of empty
 // groups/matches.
-const hasTournamentStarted = computed(() => participants.value.length > 0);
+const hasParticipants = computed(() => participants.value.length > 0);
 
-// Tournament finish + rating update state
+// Tournament start + finish + rating update state
+const startingTournament = ref(false);
 const finishingTournament = ref(false);
 const updatingRatings = ref(false);
 const revertingRatings = ref(false);
 const ratingsError = ref("");
 
+// "Started" locks the participant list (no more joining/leaving).
+// "Finished" locks match editing to admins only. These are independent
+// so an admin can lock registration while matches are still being
+// played, without having to also stop editing results.
+const isTournamentStarted = computed(() => !!tournament.value?.startedAt);
 const isTournamentFinished = computed(() => !!tournament.value?.finishedAt);
 const ratingsApplied = computed(() => !!tournament.value?.ratingsAppliedAt);
 
@@ -295,6 +301,11 @@ async function loadParticipants(tournamentId) {
 
 async function joinTournament() {
   if (!tournament.value) return;
+  if (isTournamentStarted.value) {
+    participantError.value =
+      "Registration is closed — the tournament has started.";
+    return;
+  }
   if (!currentPlayer.value) {
     participantError.value =
       "We couldn't find a player profile for your account.";
@@ -338,6 +349,11 @@ async function joinTournament() {
 
 async function leaveTournament() {
   if (!tournament.value || !currentPlayer.value) return;
+  if (isTournamentStarted.value) {
+    participantError.value =
+      "Registration is closed — the tournament has started.";
+    return;
+  }
   leavingTournament.value = true;
   participantError.value = "";
   try {
@@ -710,6 +726,58 @@ async function submitMatch(match) {
 
 const isActive = computed(() => tournament.value !== null);
 
+// --- Admin: start / reopen registration ---
+async function startTournament() {
+  if (!tournament.value || !isAdmin.value) return;
+  if (participants.value.length === 0) {
+    ratingsError.value =
+      "Add at least one participant before starting the tournament.";
+    return;
+  }
+  const confirmed = window.confirm(
+    "Start this tournament? Participants won't be able to join or leave anymore.",
+  );
+  if (!confirmed) return;
+
+  startingTournament.value = true;
+  ratingsError.value = "";
+  try {
+    await setDoc(
+      doc(db, "tournaments", tournament.value.id),
+      { startedAt: serverTimestamp() },
+      { merge: true },
+    );
+    tournament.value = { ...tournament.value, startedAt: new Date() };
+  } catch (e) {
+    ratingsError.value = e.message || "Unable to start the tournament.";
+  } finally {
+    startingTournament.value = false;
+  }
+}
+
+async function reopenRegistration() {
+  if (!tournament.value || !isAdmin.value) return;
+  const confirmed = window.confirm(
+    "Reopen registration? Participants will be able to join or leave again.",
+  );
+  if (!confirmed) return;
+
+  startingTournament.value = true;
+  ratingsError.value = "";
+  try {
+    await setDoc(
+      doc(db, "tournaments", tournament.value.id),
+      { startedAt: null },
+      { merge: true },
+    );
+    tournament.value = { ...tournament.value, startedAt: null };
+  } catch (e) {
+    ratingsError.value = e.message || "Unable to reopen registration.";
+  } finally {
+    startingTournament.value = false;
+  }
+}
+
 // --- Admin: finish / reopen the tournament ---
 async function finishTournament() {
   if (!tournament.value || !isAdmin.value) return;
@@ -915,6 +983,32 @@ onUnmounted(() => {
           <span v-if="isTournamentFinished" class="status-pill finished"
             >Finished</span
           >
+          <span
+            v-else-if="isTournamentStarted"
+            class="status-pill started"
+            >In Progress</span
+          >
+
+          <button
+            v-if="!isTournamentStarted"
+            type="button"
+            class="admin-action-btn start-btn"
+            :disabled="startingTournament"
+            @click="startTournament"
+          >
+            {{ startingTournament ? "Starting..." : "Start Tournament" }}
+          </button>
+          <button
+            v-else-if="!isTournamentFinished"
+            type="button"
+            class="admin-action-btn reopen-btn"
+            :disabled="startingTournament"
+            @click="reopenRegistration"
+          >
+            {{
+              startingTournament ? "Reopening..." : "Reopen Registration"
+            }}
+          </button>
 
           <button
             v-if="!isTournamentFinished"
@@ -986,7 +1080,7 @@ onUnmounted(() => {
       <div v-if="activeTab === 'groups'" class="tab-content">
         <h2>Group Stage</h2>
 
-        <div v-if="!hasTournamentStarted" class="not-started">
+        <div v-if="!hasParticipants" class="not-started">
           <h3>Tournament hasn't started</h3>
           <p>
             Group play will appear here once players have joined. Head to
@@ -1171,7 +1265,7 @@ onUnmounted(() => {
           </p>
 
           <button
-            v-if="currentPlayer && !isParticipant"
+            v-if="currentPlayer && !isParticipant && !isTournamentStarted"
             type="button"
             class="join-btn"
             :disabled="joiningTournament"
@@ -1181,7 +1275,7 @@ onUnmounted(() => {
           </button>
 
           <button
-            v-else-if="currentPlayer && isParticipant"
+            v-else-if="currentPlayer && isParticipant && !isTournamentStarted"
             type="button"
             class="leave-btn"
             :disabled="leavingTournament"
@@ -1189,6 +1283,13 @@ onUnmounted(() => {
           >
             {{ leavingTournament ? "Leaving..." : "Leave Tournament" }}
           </button>
+
+          <p
+            v-else-if="currentPlayer && isTournamentStarted"
+            class="participants-hint"
+          >
+            Registration is closed — the tournament has started.
+          </p>
 
           <p v-else class="participants-hint">
             Sign in with a player profile to join this tournament.
@@ -1235,7 +1336,7 @@ onUnmounted(() => {
       <div v-if="activeTab === 'bracket'" class="tab-content">
         <h2>Elimination Bracket</h2>
 
-        <div v-if="!hasTournamentStarted" class="not-started">
+        <div v-if="!hasParticipants" class="not-started">
           <h3>Tournament hasn't started</h3>
           <p>
             The bracket will appear here once players have joined. Head to
@@ -1475,7 +1576,7 @@ onUnmounted(() => {
   flex-wrap: wrap;
   justify-content: flex-end;
   gap: 0.5rem;
-  max-width: 260px;
+  max-width: 320px;
 }
 
 @media (max-width: 700px) {
@@ -1502,6 +1603,12 @@ onUnmounted(() => {
   border: 1px solid rgba(255, 255, 255, 0.12);
 }
 
+.status-pill.started {
+  color: #6be0a3;
+  background: rgba(107, 224, 163, 0.1);
+  border: 1px solid rgba(107, 224, 163, 0.3);
+}
+
 .admin-action-btn {
   flex-shrink: 0;
   border-radius: 6px;
@@ -1520,6 +1627,11 @@ onUnmounted(() => {
 
 .admin-action-btn:not(:disabled):hover {
   opacity: 0.85;
+}
+
+.start-btn {
+  background: hsl(var(--primary-color));
+  color: #0f0f0f;
 }
 
 .finish-btn {
