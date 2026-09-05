@@ -556,13 +556,44 @@ function qualifiedBracketSlots() {
   return slots;
 }
 
+// Returns the winning player of a bracket match, or null if the match
+// hasn't been decided yet (missing a player, not submitted, or scores
+// aren't valid numbers).
+function getMatchWinner(match) {
+  if (!match.player1 || !match.player2) return null;
+  if (!savedMatches.value[match.id]) return null;
+  const s1 = Number(matchScore(match.id, 1));
+  const s2 = Number(matchScore(match.id, 2));
+  if (Number.isNaN(s1) || Number.isNaN(s2)) return null;
+  return s1 > s2 ? match.player1 : match.player2;
+}
+
+// Fills in each round's player1/player2 from the previous round's
+// winners. Processed round-by-round in order so results cascade forward
+// in a single pass — by the time we look at round N's winners to fill
+// round N+1, round N has already been populated from round N-1.
+function propagateBracketWinners(rounds) {
+  for (let r = 0; r < rounds.length - 1; r++) {
+    const currentRound = rounds[r];
+    const nextRound = rounds[r + 1];
+    nextRound.matches.forEach((nextMatch, idx) => {
+      const feederA = currentRound.matches[idx * 2];
+      const feederB = currentRound.matches[idx * 2 + 1];
+      nextMatch.player1 = feederA ? getMatchWinner(feederA) : null;
+      nextMatch.player2 = feederB ? getMatchWinner(feederB) : null;
+    });
+  }
+  return rounds;
+}
+
 function generateBracket() {
   if (!groupStageComplete.value) {
     bracket.value = [];
     return;
   }
   const slots = qualifiedBracketSlots();
-  bracket.value = slots.length > 0 ? generateBracketRounds(slots) : [];
+  bracket.value =
+    slots.length > 0 ? propagateBracketWinners(generateBracketRounds(slots)) : [];
 }
 
 function generateBracketRounds(playersList) {
