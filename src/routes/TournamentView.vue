@@ -574,6 +574,7 @@ function generateBracketRounds(playersList) {
   for (let i = 0; i < playersList.length; i += 2) {
     currentRound.push({
       match: Math.floor(i / 2),
+      matchNumber: Math.floor(i / 2) + 1,
       id: `bracket-r0-m${Math.floor(i / 2)}`,
       stage: "bracket",
       round: `Round of ${playersList.length}`,
@@ -593,6 +594,7 @@ function generateBracketRounds(playersList) {
     for (let i = 0; i < currentRound.length; i += 2) {
       nextRound.push({
         match: Math.floor(i / 2),
+        matchNumber: Math.floor(i / 2) + 1,
         id: `bracket-r${rounds.length}-m${Math.floor(i / 2)}`,
         stage: "bracket",
         round:
@@ -697,7 +699,7 @@ async function submitMatch(match) {
         stage: match.stage || "bracket",
         groupId: match.groupId || null,
         round: match.round || null,
-        matchNumber: match.matchNumber,
+        matchNumber: match.matchNumber ?? null,
         player1Id: match.player1.id,
         player2Id: match.player2.id,
         player1Score,
