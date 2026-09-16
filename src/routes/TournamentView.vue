@@ -6,12 +6,39 @@ import {
   collection,
   query,
   where,
+  getDoc,
   getDocs,
   doc,
   setDoc,
   deleteDoc,
   serverTimestamp,
 } from "firebase/firestore";
+import {
+  applyAvailability,
+  applyTournamentRatings,
+  fetchTournaments,
+  revertAvailability,
+  revertTournamentRatings,
+} from "../ratings";
+import {
+  buildBracketRounds,
+  computeGroupStandings,
+  deserializeStructure,
+  groupMatchDefs,
+  reconcileStructure,
+  serializeStructure,
+} from "../tournamentStructure";
+import {
+  acceptTeamInvite,
+  cancelTeamInvite,
+  declineTeamInvite,
+  disbandTeam,
+  eligiblePartners,
+  fetchTeamInvites,
+  fetchTeamsForTournament,
+  sendTeamInvite,
+} from "../teams";
+import { toJsDate } from "../dates";
 
 const tournament = ref(null);
 const loading = ref(false);
@@ -22,12 +49,12 @@ const players = ref([]);
 // profile even before they've joined the tournament.
 const allPlayers = ref([]);
 
-// Tournament structure
-const groups = ref([]);
-const bracket = ref([]);
+// Match documents from Firestore, keyed by match ID. These are the source of
+// truth for what was actually played — including which players a match was
+// created for, which is how a finished draw survives participant changes.
+const matchDocs = ref({});
 const scores = ref({});
 const savingMatch = ref(null);
-const savedMatches = ref({});
 const matchError = ref("");
 
 // Group-stage UI state
@@ -38,7 +65,23 @@ const editingMatch = ref({});
 const participants = ref([]);
 const joiningTournament = ref(false);
 const leavingTournament = ref(false);
+const removingParticipantId = ref(null);
 const participantError = ref("");
+
+// Frozen draw from /tournaments/{id}/structure/main, when one exists.
+const lockedStructure = ref(null);
+const savingDraw = ref(false);
+
+// Doubles: teams for this tournament + open partner invites. Only loaded
+// when the tournament's format is "doubles".
+const teams = ref([]);
+const teamInvites = ref([]);
+const selectedPartnerId = ref("");
+const sendingInvite = ref(false);
+const respondingInviteId = ref(null);
+const leavingTeam = ref(false);
+const removingTeamId = ref(null);
+const teamError = ref("");
 
 // Bracket reveal timing
 const now = ref(new Date());
@@ -51,9 +94,15 @@ const currentUser = computed(() => auth.currentUser);
 function isMatchPlayer(match) {
   const uid = currentUser.value?.uid;
   if (!uid) return false;
-  return [match.player1, match.player2].some(
-    (player) => player?.id === uid || player?.authUid === uid,
-  );
+  return [match.player1, match.player2].some((entity) => {
+    if (!entity) return false;
+    // Doubles entities are teams — check both players on the team rather
+    // than the team's own (non-auth) ID.
+    if (Array.isArray(entity.players)) {
+      return entity.players.some((p) => p.id === uid);
+    }
+    return entity.id === uid || entity.authUid === uid;
+  });
 }
 
 function canEditMatch(match) {
@@ -85,16 +134,6 @@ const isParticipant = computed(() => {
   return participants.value.some((p) => p.id === currentPlayer.value.id);
 });
 
-// Accepts a Firestore Timestamp, JS Date, epoch number, or date string.
-function toJsDate(value) {
-  if (!value) return null;
-  if (typeof value?.toDate === "function") return value.toDate();
-  if (value instanceof Date) return value;
-  if (typeof value === "number") return new Date(value);
-  if (typeof value === "string") return new Date(value);
-  return null;
-}
-
 // The bracket unlocks at 6:00 PM (local time) on the tournament's date.
 const bracketUnlockAt = computed(() => {
   const d = toJsDate(tournament.value?.date);
@@ -121,11 +160,6 @@ const isBracketUnlocked = computed(() => {
   return now.value.getTime() >= bracketUnlockAt.value.getTime();
 });
 
-// Group play and the bracket only make sense once someone has actually
-// joined. Until then, show a "hasn't started" message instead of empty
-// groups/matches.
-const hasTournamentStarted = computed(() => participants.value.length > 0);
-
 // Tournament finish + rating update state
 const finishingTournament = ref(false);
 const updatingRatings = ref(false);
@@ -134,79 +168,257 @@ const ratingsError = ref("");
 
 const isTournamentFinished = computed(() => !!tournament.value?.finishedAt);
 const ratingsApplied = computed(() => !!tournament.value?.ratingsAppliedAt);
+const isDoublesFormat = computed(() => tournament.value?.format === "doubles");
 
-// --- Rating math (as provided) ---
-const inverseLogCurve = (x, a, b) => {
-  return 1 / Math.log10(Math.pow(10, 1 / a) + x * b);
-};
+// --- The draw (groups + bracket) --------------------------------------
+//
+// The draw is never derived from the live participant list once there's
+// any match evidence to rebuild it from. In priority order:
+//   1. An explicitly locked draw, saved at /tournaments/{id}/structure/main.
+//   2. Reconstructed from the match documents themselves — those record
+//      the player IDs they were created for, so a late approval, a join,
+//      a removal, or even reopening the tournament can't reshuffle groups
+//      that were already played. Anyone who's joined but hasn't played a
+//      recorded match yet is appended as a trailing group rather than
+//      forcing a reshuffle of everyone else.
+//   3. Only when there's no match evidence at all (a brand-new tournament)
+//      does the draw follow the live participant list.
+const drawLocked = computed(() => !!lockedStructure.value);
 
-const updateRating = (initialRating, opponentRating, won) => {
-  let newRating = initialRating;
-
-  let ratingDiff = opponentRating - initialRating;
-  let handicapDiff = ratingDiff / 100;
-
-  // Cap the handicap difference to a maximum of 8
-  if (handicapDiff > 8) handicapDiff = 8;
-  else if (handicapDiff < -8) handicapDiff = -8;
-
-  // Calculate ERC and URC based on handicap difference
-  let ercDepConst = 0.05; // Suggested constant for ERC calculation
-  let upsetDepConst = 1.1 * 0.01; // Suggested constant for URC calculation
-  let initialErc = 9.0; // Suggested initial ERC value
-
-  let erc = inverseLogCurve(Math.abs(handicapDiff), initialErc, ercDepConst);
-  let upsetProbability =
-    inverseLogCurve(Math.abs(handicapDiff), 50.0, upsetDepConst) / 100.0;
-
-  let urc = Math.round((erc * (1 - upsetProbability)) / upsetProbability);
-
-  // Adjust rating based on match outcome
-  if (won) {
-    if (handicapDiff > 0) {
-      // Player beat higher rated player
-      newRating += urc;
-    } // Player beat lower rated player
-    else {
-      newRating += erc;
-    }
-  } else {
-    if (handicapDiff > 0) {
-      // Player lost to higher rated player
-      newRating -= erc;
-    } // Player lost to lower rated player
-    else {
-      newRating -= urc;
-    }
-  }
-
-  return Math.round(newRating);
-};
-
-// Computes each player's NET rating delta across every submitted match in
-// the tournament. Every match is evaluated against each player's frozen
-// pre-tournament rating (initialRatingsById), never against a
-// running/updated rating, so results don't depend on match order and
-// don't accumulate match-over-match.
-function computeTournamentRatingDeltas(matches, initialRatingsById) {
-  const deltas = {};
-  matches.forEach((match) => {
-    const { player1Id, player2Id, winnerPlayerId } = match;
-    if (!player1Id || !player2Id) return;
-
-    const r1 = initialRatingsById[player1Id];
-    const r2 = initialRatingsById[player2Id];
-    if (typeof r1 !== "number" || typeof r2 !== "number") return;
-
-    const player1Won = winnerPlayerId === player1Id;
-    const player1New = updateRating(r1, r2, player1Won);
-    const player2New = updateRating(r2, r1, !player1Won);
-
-    deltas[player1Id] = (deltas[player1Id] || 0) + (player1New - r1);
-    deltas[player2Id] = (deltas[player2Id] || 0) + (player2New - r2);
+// Doubles participant docs are still one per player (per the schema) —
+// the entities the draw actually seats are the distinct teams among them.
+const doublesTeamIds = computed(() => {
+  const ids = new Set();
+  participants.value.forEach((p) => {
+    if (p.teamId) ids.add(p.teamId);
   });
-  return deltas;
+  return [...ids];
+});
+
+const drawEntryIds = computed(() =>
+  isDoublesFormat.value ? doublesTeamIds.value : players.value.map((p) => p.id),
+);
+
+// Frozen (initialRating) rating per draw entity — used only to seed the
+// bracket once group stage is complete (group winners/runners-up are
+// ranked by this within their tier). Doubles: a team's rating is whatever
+// was recorded on either of its two participant docs (both carry the
+// same value).
+const entityRatingsById = computed(() => {
+  const ratings = {};
+  participants.value.forEach((p) => {
+    if (typeof p.initialRating !== "number") return;
+    const entityId = isDoublesFormat.value ? p.teamId : p.id;
+    if (entityId) ratings[entityId] = p.initialRating;
+  });
+  return ratings;
+});
+
+const structure = computed(() => {
+  if (lockedStructure.value) return lockedStructure.value;
+  return reconcileStructure(
+    Object.values(matchDocs.value),
+    drawEntryIds.value,
+    entityRatingsById.value,
+  );
+});
+
+// Name/photo/rating lookup for any player ID in the draw. Name and photo
+// come from the live player doc (people update those); rating is the
+// player's *initialRating* snapshot — the rating they carried into this
+// tournament — not their live current rating, so groups and the bracket
+// read as a record of what the tournament actually looked like rather
+// than shifting every time a later tournament's ratings are applied.
+// Falls back to the denormalized fields on the participant doc, then to a
+// placeholder, so a deleted player doc still leaves a readable bracket.
+const playerDirectory = computed(() => {
+  const directory = {};
+  participants.value.forEach((p) => {
+    directory[p.id] = {
+      id: p.id,
+      fullName: p.playerName || "Unknown player",
+      profilePhotoUrl: p.playerPhotoUrl || null,
+      currentRating:
+        typeof p.initialRating === "number" ? p.initialRating : null,
+    };
+  });
+  allPlayers.value.forEach((p) => {
+    const historicalRating = directory[p.id]?.currentRating;
+    directory[p.id] = {
+      ...directory[p.id],
+      ...p,
+      fullName: p.fullName || directory[p.id]?.fullName || "Unknown player",
+      profilePhotoUrl:
+        p.profilePhotoUrl || directory[p.id]?.profilePhotoUrl || null,
+      // Prefer the tournament-time snapshot over the live rating whenever
+      // one was recorded; only a player with no snapshot at all (shouldn't
+      // normally happen) falls through to their current rating.
+      currentRating:
+        typeof historicalRating === "number"
+          ? historicalRating
+          : p.currentRating,
+    };
+  });
+  return directory;
+});
+
+// Doubles equivalent of playerDirectory: name/rating for each team, built
+// from the live /teams doc (name, live teamRating) merged with the
+// participants' frozen initialRating snapshot, same historical-rating
+// preference as playerDirectory. `players` carries the two participant
+// docs so isMatchPlayer can check either player's uid against a match.
+const teamDirectory = computed(() => {
+  const directory = {};
+  const byTeam = {};
+  participants.value.forEach((p) => {
+    if (!p.teamId) return;
+    (byTeam[p.teamId] ??= []).push(p);
+  });
+
+  teams.value.forEach((t) => {
+    const pair = byTeam[t.id] ?? [];
+    const historicalRating =
+      typeof pair[0]?.initialRating === "number" ? pair[0].initialRating : null;
+    directory[t.id] = {
+      id: t.id,
+      fullName:
+        t.teamName ||
+        pair.map((p) => p.playerName || "Unknown").join(" & ") ||
+        "Unknown team",
+      currentRating:
+        typeof historicalRating === "number" ? historicalRating : t.teamRating,
+      players: pair,
+    };
+  });
+
+  // A team referenced by participants/matches whose /teams doc is missing
+  // for some reason still gets a readable entry instead of a blank one.
+  Object.entries(byTeam).forEach(([teamId, pair]) => {
+    if (directory[teamId]) return;
+    directory[teamId] = {
+      id: teamId,
+      fullName:
+        pair.map((p) => p.playerName || "Unknown").join(" & ") ||
+        "Unknown team",
+      currentRating:
+        typeof pair[0]?.initialRating === "number"
+          ? pair[0].initialRating
+          : null,
+      players: pair,
+    };
+  });
+
+  return directory;
+});
+
+function playerFor(entityId) {
+  if (!entityId) return null;
+  const directory = isDoublesFormat.value
+    ? teamDirectory.value
+    : playerDirectory.value;
+  return (
+    directory[entityId] ?? {
+      id: entityId,
+      fullName: isDoublesFormat.value ? "Unknown team" : "Unknown player",
+      currentRating: null,
+    }
+  );
 }
+
+function hydrateMatch(matchDef) {
+  return {
+    ...matchDef,
+    player1: playerFor(matchDef.player1Id),
+    player2: playerFor(matchDef.player2Id),
+  };
+}
+
+function ratingLabel(player) {
+  return typeof player?.currentRating === "number"
+    ? Math.round(player.currentRating)
+    : "—";
+}
+
+// Prefers the player's live photo (so a later profile-photo change shows
+// up here too), falling back to whatever was denormalized onto the
+// participant doc at join time.
+function participantPhoto(participant) {
+  return (
+    playerFor(participant.id)?.profilePhotoUrl ||
+    participant.playerPhotoUrl ||
+    null
+  );
+}
+
+// Each group member's win/loss record (live, updates as group matches
+// come in) and whether they've actually been seeded into the bracket —
+// that only turns on once the *whole* group stage is done and seeding
+// has run (see deriveBracketSeedsFromGroups), not just "currently
+// leading," since a still-in-progress group's top 2 isn't locked in yet.
+const groups = computed(() => {
+  const allMatches = Object.values(matchDocs.value);
+  const seededIds = new Set(
+    (structure.value.bracketSeeds ?? []).filter(Boolean),
+  );
+  return (structure.value.groups ?? []).map((groupDef) => {
+    const standingsById = {};
+    computeGroupStandings(groupDef, allMatches).forEach((row) => {
+      standingsById[row.playerId] = row;
+    });
+    return {
+      id: groupDef.id,
+      players: groupDef.playerIds
+        .map(playerFor)
+        .filter(Boolean)
+        .map((p) => ({
+          ...p,
+          wins: standingsById[p.id]?.wins ?? 0,
+          losses: standingsById[p.id]?.losses ?? 0,
+          advanced: seededIds.has(p.id),
+        })),
+      matches: groupMatchDefs(groupDef).map(hydrateMatch),
+    };
+  });
+});
+
+// Winners are carried forward, so rounds past the first show real names
+// once their feeder matches are reported instead of a permanent "TBD".
+const bracket = computed(() =>
+  buildBracketRounds(
+    structure.value.bracketSeeds ?? [],
+    (matchId) => matchDocs.value[matchId]?.winnerPlayerId ?? null,
+  ).map((round) => ({
+    name: round.name,
+    matches: round.matches.map(hydrateMatch),
+  })),
+);
+
+const drawPlayerIds = computed(() => {
+  const ids = new Set();
+  (structure.value.groups ?? []).forEach((g) =>
+    g.playerIds.forEach((id) => id && ids.add(id)),
+  );
+  (structure.value.bracketSeeds ?? []).forEach((id) => id && ids.add(id));
+  return [...ids];
+});
+
+// Group play and the bracket only make sense once there's a draw. Until
+// then, show a "hasn't started" message instead of empty groups/matches.
+const hasTournamentStarted = computed(() => drawPlayerIds.value.length > 0);
+
+// A match counts as reported once it has both scores on record.
+const savedMatches = computed(() => {
+  const reported = {};
+  Object.entries(matchDocs.value).forEach(([matchId, data]) => {
+    if (
+      typeof data.player1Score === "number" &&
+      typeof data.player2Score === "number"
+    ) {
+      reported[matchId] = true;
+    }
+  });
+  return reported;
+});
 
 async function loadUserAuthorization() {
   const user = auth.currentUser;
@@ -220,20 +432,32 @@ async function loadUserAuthorization() {
 async function loadActiveTournament() {
   loading.value = true;
   try {
-    // Query for active tournament (where status === "active" or similar)
     const q = query(
       collection(db, "tournaments"),
       where("status", "==", "active"),
     );
     const snaps = await getDocs(q);
-    if (snaps.docs.length > 0) {
-      const t = snaps.docs[0];
-      tournament.value = { id: t.id, ...t.data() };
+    // A finished tournament is never "the" active one, even if its status
+    // field never got flipped (true for anything finished before that
+    // became part of finishing a tournament) — otherwise a newly-approved
+    // player can land on a tournament that's supposed to be long closed.
+    // If more than one somehow qualifies, prefer the most recent by date.
+    const candidates = snaps.docs
+      .map((d) => ({ id: d.id, ...d.data() }))
+      .filter((t) => !t.finishedAt)
+      .sort(
+        (a, b) =>
+          (toJsDate(b.date)?.getTime() ?? 0) -
+          (toJsDate(a.date)?.getTime() ?? 0),
+      );
+
+    if (candidates.length > 0) {
+      tournament.value = candidates[0];
       await loadParticipants(tournament.value.id);
       await loadTournamentPlayers(tournament.value.id);
-      generateGroups();
-      generateBracket();
       await loadTournamentMatches(tournament.value.id);
+      await loadDraw(tournament.value.id);
+      await loadTeamsAndInvites(tournament.value.id);
     }
   } catch (e) {
     console.error("loadActiveTournament", e);
@@ -267,18 +491,52 @@ async function loadTournamentMatches(tournamentId) {
     const snaps = await getDocs(
       collection(db, "tournaments", tournamentId, "matches"),
     );
+    const loadedDocs = {};
+    const loadedScores = {};
     snaps.docs.forEach((d) => {
-      const data = d.data();
+      const data = { id: d.id, ...d.data() };
+      loadedDocs[d.id] = data;
       if (
         typeof data.player1Score === "number" &&
         typeof data.player2Score === "number"
       ) {
-        scores.value[d.id] = { 1: data.player1Score, 2: data.player2Score };
-        savedMatches.value[d.id] = true;
+        loadedScores[d.id] = { 1: data.player1Score, 2: data.player2Score };
       }
     });
+    matchDocs.value = loadedDocs;
+    scores.value = loadedScores;
   } catch (e) {
     console.error("loadTournamentMatches", e);
+  }
+}
+
+async function loadDraw(tournamentId) {
+  try {
+    const snap = await getDoc(
+      doc(db, "tournaments", tournamentId, "structure", "main"),
+    );
+    lockedStructure.value = snap.exists()
+      ? deserializeStructure(snap.data())
+      : null;
+  } catch (e) {
+    console.error("loadDraw", e);
+    lockedStructure.value = null;
+  }
+}
+
+// Loaded unconditionally — cheap (a single equality query each, empty for
+// a singles tournament) and avoids threading format checks through the
+// loading chain.
+async function loadTeamsAndInvites(tournamentId) {
+  try {
+    const [teamDocs, invites] = await Promise.all([
+      fetchTeamsForTournament(tournamentId),
+      fetchTeamInvites(tournamentId),
+    ]);
+    teams.value = teamDocs;
+    teamInvites.value = invites;
+  } catch (e) {
+    console.error("loadTeamsAndInvites", e);
   }
 }
 
@@ -300,6 +558,14 @@ async function joinTournament() {
       "We couldn't find a player profile for your account.";
     return;
   }
+  // Joining after the fact would land a player in a draw that has already
+  // been played — which is exactly how groups used to get reshuffled
+  // underneath reported results.
+  if (isTournamentFinished.value) {
+    participantError.value =
+      "This tournament is finished — sign-ups are closed.";
+    return;
+  }
   joiningTournament.value = true;
   participantError.value = "";
   try {
@@ -314,11 +580,12 @@ async function joinTournament() {
       {
         playerId: currentPlayer.value.id,
         playerName: currentPlayer.value.fullName || "",
-        playerPhotoUrl: currentPlayer.value.photoUrl || null,
+        playerPhotoUrl: currentPlayer.value.profilePhotoUrl || null,
         teamId: null,
-        // Frozen at join time so rating math always uses the rating the
-        // player had before this tournament, regardless of when ratings
-        // are actually applied.
+        joinedAt: serverTimestamp(),
+        // Snapshot of the rating carried in. Re-written by the rating
+        // engine when ratings are applied, so it always reflects what was
+        // actually computed against.
         initialRating:
           typeof currentPlayer.value.currentRating === "number"
             ? currentPlayer.value.currentRating
@@ -327,8 +594,6 @@ async function joinTournament() {
     );
     await loadParticipants(tournament.value.id);
     refreshRegisteredPlayers();
-    generateGroups();
-    generateBracket();
   } catch (e) {
     participantError.value = e.message || "Unable to join the tournament.";
   } finally {
@@ -338,6 +603,11 @@ async function joinTournament() {
 
 async function leaveTournament() {
   if (!tournament.value || !currentPlayer.value) return;
+  if (isTournamentFinished.value) {
+    participantError.value =
+      "This tournament is finished — ask an admin if you need to be removed.";
+    return;
+  }
   leavingTournament.value = true;
   participantError.value = "";
   try {
@@ -352,8 +622,6 @@ async function leaveTournament() {
     );
     await loadParticipants(tournament.value.id);
     refreshRegisteredPlayers();
-    generateGroups();
-    generateBracket();
   } catch (e) {
     participantError.value = e.message || "Unable to leave the tournament.";
   } finally {
@@ -361,119 +629,202 @@ async function leaveTournament() {
   }
 }
 
-function generateGroups() {
-  const groupSize = 4;
-  const numGroups = Math.ceil(players.value.length / groupSize);
-  const groupsArray = [];
+// Admin cleanup for people who ended up on a tournament they didn't play.
+async function removeParticipant(participant) {
+  if (!tournament.value || !isAdmin.value) return;
+  const label = participant.playerName || participant.id;
+  if (!window.confirm(`Remove ${label} from this tournament?`)) return;
 
-  for (let i = 0; i < numGroups; i++) {
-    const start = i * groupSize;
-    const end = Math.min(start + groupSize, players.value.length);
-    const groupId = String.fromCharCode(65 + i); // A, B, C, ...
-    groupsArray.push({
-      id: groupId,
-      players: players.value.slice(start, end),
-      matches: createGroupMatches(players.value.slice(start, end), groupId),
-    });
+  removingParticipantId.value = participant.id;
+  participantError.value = "";
+  try {
+    await deleteDoc(
+      doc(
+        db,
+        "tournaments",
+        tournament.value.id,
+        "participants",
+        participant.id,
+      ),
+    );
+    await loadParticipants(tournament.value.id);
+    refreshRegisteredPlayers();
+  } catch (e) {
+    participantError.value = e.message || "Unable to remove this participant.";
+  } finally {
+    removingParticipantId.value = null;
   }
-  groups.value = groupsArray;
+}
 
-  // Default the first group open, leave the rest collapsed. Preserve any
-  // expanded/collapsed state a user already toggled if this runs again.
-  groupsArray.forEach((g, idx) => {
-    if (!(g.id in expandedGroups.value)) {
-      expandedGroups.value[g.id] = idx === 0;
+// --- Doubles: partnering -----------------------------------------------
+
+const myParticipantRecord = computed(() => {
+  if (!currentPlayer.value) return null;
+  return (
+    participants.value.find((p) => p.id === currentPlayer.value.id) ?? null
+  );
+});
+
+const myTeamId = computed(() => myParticipantRecord.value?.teamId ?? null);
+
+// Raw /teams doc — used for actions (has player1Id/player2Id directly).
+const myRawTeam = computed(
+  () => teams.value.find((t) => t.id === myTeamId.value) ?? null,
+);
+
+// Hydrated version — used for display (name, historical rating).
+const myTeam = computed(() =>
+  myTeamId.value ? teamDirectory.value[myTeamId.value] : null,
+);
+
+const myPartnerName = computed(() => {
+  if (!myTeam.value || !currentPlayer.value) return "your partner";
+  const other = (myTeam.value.players || []).find(
+    (p) => p.id !== currentPlayer.value.id,
+  );
+  return other?.playerName || "your partner";
+});
+
+const outgoingInvite = computed(() => {
+  if (!currentPlayer.value) return null;
+  return (
+    teamInvites.value.find(
+      (inv) =>
+        inv.status === "pending" && inv.fromPlayerId === currentPlayer.value.id,
+    ) ?? null
+  );
+});
+
+const incomingInvites = computed(() => {
+  if (!currentPlayer.value) return [];
+  return teamInvites.value.filter(
+    (inv) =>
+      inv.status === "pending" && inv.toPlayerId === currentPlayer.value.id,
+  );
+});
+
+const eligiblePartnersList = computed(() => {
+  if (!currentPlayer.value) return [];
+  return eligiblePartners(
+    allPlayers.value,
+    participants.value,
+    teamInvites.value,
+    currentPlayer.value.id,
+  );
+});
+
+async function sendPartnerInvite() {
+  if (!tournament.value || !currentPlayer.value || !selectedPartnerId.value)
+    return;
+  const partner = allPlayers.value.find(
+    (p) => p.id === selectedPartnerId.value,
+  );
+  if (!partner) return;
+
+  sendingInvite.value = true;
+  teamError.value = "";
+  try {
+    await sendTeamInvite(tournament.value.id, currentPlayer.value, partner);
+    selectedPartnerId.value = "";
+    await loadTeamsAndInvites(tournament.value.id);
+  } catch (e) {
+    teamError.value = e.message || "Unable to send invite.";
+  } finally {
+    sendingInvite.value = false;
+  }
+}
+
+async function respondToInvite(invite, accept) {
+  if (!tournament.value) return;
+  respondingInviteId.value = invite.id;
+  teamError.value = "";
+  try {
+    if (accept) {
+      await acceptTeamInvite(invite);
+    } else {
+      await declineTeamInvite(invite);
     }
-  });
+    await Promise.all([
+      loadParticipants(tournament.value.id),
+      loadTeamsAndInvites(tournament.value.id),
+    ]);
+    refreshRegisteredPlayers();
+  } catch (e) {
+    teamError.value = e.message || "Unable to respond to this invite.";
+  } finally {
+    respondingInviteId.value = null;
+  }
 }
 
-function generateBracket() {
-  // Generate single-elimination bracket
-  // For testing, use 32-player default
-  const playersForBracket =
-    players.value.length > 0 ? players.value : generateTestPlayers(32);
-
-  bracket.value = generateBracketRounds(playersForBracket);
+async function cancelMyInvite() {
+  if (!outgoingInvite.value) return;
+  respondingInviteId.value = outgoingInvite.value.id;
+  teamError.value = "";
+  try {
+    await cancelTeamInvite(outgoingInvite.value);
+    await loadTeamsAndInvites(tournament.value.id);
+  } catch (e) {
+    teamError.value = e.message || "Unable to cancel this invite.";
+  } finally {
+    respondingInviteId.value = null;
+  }
 }
 
-function generateTestPlayers(count) {
-  const testPlayers = [];
-  for (let i = 1; i <= count; i++) {
-    testPlayers.push({
-      id: `test-${i}`,
-      fullName: `Player ${i}`,
-      currentRating: 1000 + Math.random() * 500,
-    });
+async function leaveMyTeam() {
+  if (!tournament.value || !myRawTeam.value) return;
+  if (isTournamentFinished.value) {
+    teamError.value =
+      "This tournament is finished — ask an admin if you need changes.";
+    return;
   }
-  return testPlayers;
+  if (
+    !window.confirm(
+      "Disband your team? This removes both of you from the tournament.",
+    )
+  )
+    return;
+
+  leavingTeam.value = true;
+  teamError.value = "";
+  try {
+    const playerIds = [
+      myRawTeam.value.player1Id,
+      myRawTeam.value.player2Id,
+    ].filter(Boolean);
+    await disbandTeam(tournament.value.id, myRawTeam.value.id, playerIds);
+    await Promise.all([
+      loadParticipants(tournament.value.id),
+      loadTeamsAndInvites(tournament.value.id),
+    ]);
+    refreshRegisteredPlayers();
+  } catch (e) {
+    teamError.value = e.message || "Unable to leave the team.";
+  } finally {
+    leavingTeam.value = false;
+  }
 }
 
-function generateBracketRounds(playersList) {
-  // Generate rounds for single-elimination bracket
-  const rounds = [];
-  let currentRound = [];
+// Admin cleanup, parallel to removeParticipant for singles.
+async function removeTeam(team) {
+  if (!tournament.value || !isAdmin.value) return;
+  const label = team.teamName || team.id;
+  if (!window.confirm(`Remove team "${label}" from this tournament?`)) return;
 
-  // Initialize with players
-  for (let i = 0; i < playersList.length; i += 2) {
-    currentRound.push({
-      match: Math.floor(i / 2),
-      id: `bracket-r0-m${Math.floor(i / 2)}`,
-      stage: "bracket",
-      round: `Round of ${playersList.length}`,
-      player1: playersList[i] || null,
-      player2: playersList[i + 1] || null,
-      winner: null,
-    });
+  removingTeamId.value = team.id;
+  participantError.value = "";
+  try {
+    const playerIds = [team.player1Id, team.player2Id].filter(Boolean);
+    await disbandTeam(tournament.value.id, team.id, playerIds);
+    await Promise.all([
+      loadParticipants(tournament.value.id),
+      loadTeamsAndInvites(tournament.value.id),
+    ]);
+    refreshRegisteredPlayers();
+  } catch (e) {
+    participantError.value = e.message || "Unable to remove this team.";
+  } finally {
+    removingTeamId.value = null;
   }
-  rounds.push({
-    name: `Round of ${playersList.length}`,
-    matches: currentRound,
-  });
-
-  // Generate subsequent rounds
-  while (currentRound.length > 1) {
-    const nextRound = [];
-    for (let i = 0; i < currentRound.length; i += 2) {
-      nextRound.push({
-        match: Math.floor(i / 2),
-        id: `bracket-r${rounds.length}-m${Math.floor(i / 2)}`,
-        stage: "bracket",
-        round:
-          nextRound.length === 0
-            ? "Finals"
-            : `Round of ${nextRound.length * 2}`,
-        player1: null,
-        player2: null,
-        winner: null,
-      });
-    }
-    rounds.push({
-      name:
-        nextRound.length === 1 ? "Finals" : `Round of ${nextRound.length * 2}`,
-      matches: nextRound,
-    });
-    currentRound = nextRound;
-  }
-
-  return rounds;
-}
-
-function createGroupMatches(groupPlayers, groupId) {
-  const matches = [];
-  for (let first = 0; first < groupPlayers.length; first += 1) {
-    for (let second = first + 1; second < groupPlayers.length; second += 1) {
-      const matchNumber = matches.length + 1;
-      matches.push({
-        id: `group-${groupId}-m${matchNumber}`,
-        stage: "group",
-        groupId,
-        matchNumber,
-        player1: groupPlayers[first],
-        player2: groupPlayers[second],
-      });
-    }
-  }
-  return matches;
 }
 
 function matchScore(matchId, playerNumber) {
@@ -487,11 +838,14 @@ function setMatchScore(matchId, playerNumber, value) {
 
 // --- Group card expand/collapse ---
 function toggleGroupExpanded(groupId) {
-  expandedGroups.value[groupId] = !expandedGroups.value[groupId];
+  expandedGroups.value[groupId] = !isGroupExpanded(groupId);
 }
 
+// Defaults the first group open and the rest collapsed, without writing
+// state until the user actually toggles something.
 function isGroupExpanded(groupId) {
-  return !!expandedGroups.value[groupId];
+  if (groupId in expandedGroups.value) return !!expandedGroups.value[groupId];
+  return groups.value[0]?.id === groupId;
 }
 
 function groupProgress(group) {
@@ -533,28 +887,38 @@ async function submitMatch(match) {
   matchError.value = "";
   const winner = player1Score > player2Score ? match.player1 : match.player2;
   const loser = player1Score > player2Score ? match.player2 : match.player1;
+  const payload = {
+    stage: match.stage || "bracket",
+    groupId: match.groupId || null,
+    roundIndex: match.roundIndex ?? null,
+    matchNumber: match.matchNumber ?? null,
+    // player1Id/player2Id/winnerPlayerId/loserPlayerId hold team IDs for a
+    // doubles tournament (kept generic so the draw/rating code doesn't
+    // need to branch on format). winnerTeamId/loserTeamId mirror the same
+    // value for doubles, matching the schema in notes.txt.
+    player1Id: match.player1.id,
+    player2Id: match.player2.id,
+    player1Score,
+    player2Score,
+    winnerPlayerId: winner.id,
+    loserPlayerId: loser.id,
+    winnerTeamId: isDoublesFormat.value ? winner.id : null,
+    loserTeamId: isDoublesFormat.value ? loser.id : null,
+    status: "submitted",
+    submittedBy: auth.currentUser?.uid || null,
+    isVerified: false,
+  };
   try {
     await setDoc(
       doc(db, "tournaments", tournament.value.id, "matches", match.id),
-      {
-        stage: match.stage || "bracket",
-        groupId: match.groupId || null,
-        round: match.round || null,
-        matchNumber: match.matchNumber,
-        player1Id: match.player1.id,
-        player2Id: match.player2.id,
-        player1Score,
-        player2Score,
-        winnerPlayerId: winner.id,
-        loserPlayerId: loser.id,
-        status: "submitted",
-        submittedBy: auth.currentUser?.uid || null,
-        isVerified: false,
-        updatedAt: serverTimestamp(),
-      },
+      { ...payload, updatedAt: serverTimestamp() },
       { merge: true },
     );
-    savedMatches.value[match.id] = true;
+    // Mirror locally so the bracket advances the winner immediately.
+    matchDocs.value = {
+      ...matchDocs.value,
+      [match.id]: { id: match.id, ...matchDocs.value[match.id], ...payload },
+    };
     editingMatch.value[match.id] = false;
   } catch (error) {
     matchError.value = error.message || "Unable to save this result.";
@@ -565,23 +929,83 @@ async function submitMatch(match) {
 
 const isActive = computed(() => tournament.value !== null);
 
+// --- Admin: lock / unlock the draw ---
+async function persistDraw(draw) {
+  const payload = serializeStructure(draw);
+  await setDoc(
+    doc(db, "tournaments", tournament.value.id, "structure", "main"),
+    {
+      ...payload,
+      lockedAt: serverTimestamp(),
+      lockedBy: auth.currentUser?.uid || null,
+    },
+  );
+  lockedStructure.value = deserializeStructure(payload);
+}
+
+async function lockDraw() {
+  if (!tournament.value || !isAdmin.value) return;
+  const confirmed = window.confirm(
+    "Lock the current groups and bracket? The draw stops following the participant list, so joins or removals won't reshuffle it.",
+  );
+  if (!confirmed) return;
+
+  savingDraw.value = true;
+  ratingsError.value = "";
+  try {
+    await persistDraw(structure.value);
+  } catch (e) {
+    ratingsError.value = e.message || "Unable to lock the draw.";
+  } finally {
+    savingDraw.value = false;
+  }
+}
+
+async function unlockDraw() {
+  if (!tournament.value || !isAdmin.value) return;
+  const confirmed = window.confirm(
+    "Unlock the draw? It will go back to being reconstructed from recorded matches (or, if nothing's been played yet, from the current participant list) instead of the saved snapshot.",
+  );
+  if (!confirmed) return;
+
+  savingDraw.value = true;
+  ratingsError.value = "";
+  try {
+    await deleteDoc(
+      doc(db, "tournaments", tournament.value.id, "structure", "main"),
+    );
+    lockedStructure.value = null;
+  } catch (e) {
+    ratingsError.value = e.message || "Unable to unlock the draw.";
+  } finally {
+    savingDraw.value = false;
+  }
+}
+
 // --- Admin: finish / reopen the tournament ---
 async function finishTournament() {
   if (!tournament.value || !isAdmin.value) return;
   const confirmed = window.confirm(
-    "Finish this tournament? Players won't be able to submit or edit match results anymore. You can still edit results as an admin.",
+    "Finish this tournament? Players won't be able to submit results or sign up anymore, and the current groups and bracket will be locked in. You can still edit results as an admin.",
   );
   if (!confirmed) return;
 
   finishingTournament.value = true;
   ratingsError.value = "";
   try {
+    // Freeze the draw as it stands *before* flipping the flag, so what gets
+    // saved is the draw people actually played.
+    await persistDraw(structure.value);
     await setDoc(
       doc(db, "tournaments", tournament.value.id),
-      { finishedAt: serverTimestamp() },
+      { finishedAt: serverTimestamp(), status: "completed" },
       { merge: true },
     );
-    tournament.value = { ...tournament.value, finishedAt: new Date() };
+    tournament.value = {
+      ...tournament.value,
+      finishedAt: new Date(),
+      status: "completed",
+    };
   } catch (e) {
     ratingsError.value = e.message || "Unable to finish the tournament.";
   } finally {
@@ -601,10 +1025,14 @@ async function reopenTournament() {
   try {
     await setDoc(
       doc(db, "tournaments", tournament.value.id),
-      { finishedAt: null },
+      { finishedAt: null, status: "active" },
       { merge: true },
     );
-    tournament.value = { ...tournament.value, finishedAt: null };
+    tournament.value = {
+      ...tournament.value,
+      finishedAt: null,
+      status: "active",
+    };
   } catch (e) {
     ratingsError.value = e.message || "Unable to reopen the tournament.";
   } finally {
@@ -613,66 +1041,32 @@ async function reopenTournament() {
 }
 
 // --- Admin: apply / revert rating changes ---
+//
+// Both delegate to src/ratings.js, which also owns the ordering rule:
+// ratings go on oldest tournament first and come off newest first. The
+// availability check is what keeps this button from applying ratings out
+// of order and poisoning the starting ratings of later tournaments.
 async function updatePlayerRatings() {
   if (!tournament.value || !isAdmin.value) return;
-  const confirmed = window.confirm(
-    "Apply rating changes for every submitted match in this tournament? This updates each participant's rating.",
-  );
-  if (!confirmed) return;
 
   updatingRatings.value = true;
   ratingsError.value = "";
   try {
-    const initialRatingsById = {};
-    participants.value.forEach((p) => {
-      if (typeof p.initialRating === "number") {
-        initialRatingsById[p.id] = p.initialRating;
-      }
-    });
-
-    const matchSnaps = await getDocs(
-      collection(db, "tournaments", tournament.value.id, "matches"),
-    );
-    const matches = matchSnaps.docs
-      .map((d) => d.data())
-      .filter((m) => m.status === "submitted");
-
-    const deltas = computeTournamentRatingDeltas(matches, initialRatingsById);
-    const playerIds = Object.keys(deltas);
-
-    if (playerIds.length === 0) {
-      ratingsError.value = "No submitted matches with rating data were found.";
+    const all = await fetchTournaments();
+    const current =
+      all.find((t) => t.id === tournament.value.id) ?? tournament.value;
+    const availability = applyAvailability(current, all);
+    if (!availability.allowed) {
+      ratingsError.value = availability.reason;
       return;
     }
 
-    for (const playerId of playerIds) {
-      const previousRating = initialRatingsById[playerId];
-      const newRating = Math.round(previousRating + deltas[playerId]);
-
-      await setDoc(
-        doc(db, "players", playerId),
-        { currentRating: newRating },
-        { merge: true },
-      );
-
-      // Record exactly what changed so this can be reverted later.
-      await setDoc(
-        doc(db, "tournaments", tournament.value.id, "ratingChanges", playerId),
-        {
-          playerId,
-          previousRating,
-          newRating,
-          delta: newRating - previousRating,
-          appliedAt: serverTimestamp(),
-        },
-      );
-    }
-
-    await setDoc(
-      doc(db, "tournaments", tournament.value.id),
-      { ratingsAppliedAt: serverTimestamp() },
-      { merge: true },
+    const confirmed = window.confirm(
+      "Apply rating changes for every submitted match in this tournament? Each participant's current rating is used as their starting rating.",
     );
+    if (!confirmed) return;
+
+    await applyTournamentRatings(tournament.value.id);
     tournament.value = { ...tournament.value, ratingsAppliedAt: new Date() };
 
     // Refresh so the new ratings show up immediately in the Group Stage.
@@ -686,34 +1080,25 @@ async function updatePlayerRatings() {
 
 async function revertPlayerRatings() {
   if (!tournament.value || !isAdmin.value) return;
-  const confirmed = window.confirm(
-    "Revert the rating changes from this tournament? Every affected player's rating will be restored to what it was before this tournament. Only do this if no later tournament has already used these ratings.",
-  );
-  if (!confirmed) return;
 
   revertingRatings.value = true;
   ratingsError.value = "";
   try {
-    const snaps = await getDocs(
-      collection(db, "tournaments", tournament.value.id, "ratingChanges"),
-    );
-
-    for (const d of snaps.docs) {
-      const { playerId, previousRating } = d.data();
-      if (!playerId || typeof previousRating !== "number") continue;
-      await setDoc(
-        doc(db, "players", playerId),
-        { currentRating: previousRating },
-        { merge: true },
-      );
-      await deleteDoc(d.ref);
+    const all = await fetchTournaments();
+    const current =
+      all.find((t) => t.id === tournament.value.id) ?? tournament.value;
+    const availability = revertAvailability(current, all);
+    if (!availability.allowed) {
+      ratingsError.value = availability.reason;
+      return;
     }
 
-    await setDoc(
-      doc(db, "tournaments", tournament.value.id),
-      { ratingsAppliedAt: null },
-      { merge: true },
+    const confirmed = window.confirm(
+      "Revert the rating changes from this tournament? Every affected player's rating will be restored to what it was before this tournament, and it will drop off their rating history.",
     );
+    if (!confirmed) return;
+
+    await revertTournamentRatings(tournament.value.id);
     tournament.value = { ...tournament.value, ratingsAppliedAt: null };
 
     await loadTournamentPlayers(tournament.value.id);
@@ -757,12 +1142,15 @@ onUnmounted(() => {
       <div class="tournament-header">
         <h1>{{ tournament.name || "Current Tournament" }}</h1>
         <p v-if="tournament.date" class="date">{{ tournament.date }}</p>
-        <p class="player-count">{{ players.length }} Players</p>
+        <p class="player-count">
+          {{ drawPlayerIds.length }} {{ isDoublesFormat ? "Teams" : "Players" }}
+        </p>
 
         <div v-if="isAdmin" class="tournament-admin-actions">
           <span v-if="isTournamentFinished" class="status-pill finished"
             >Finished</span
           >
+          <span v-if="drawLocked" class="status-pill locked">Draw locked</span>
 
           <button
             v-if="!isTournamentFinished"
@@ -800,6 +1188,25 @@ onUnmounted(() => {
             @click="revertPlayerRatings"
           >
             {{ revertingRatings ? "Reverting..." : "Revert Ratings" }}
+          </button>
+
+          <button
+            v-if="!drawLocked"
+            type="button"
+            class="admin-action-btn draw-btn"
+            :disabled="savingDraw"
+            @click="lockDraw"
+          >
+            {{ savingDraw ? "Locking..." : "Lock Draw" }}
+          </button>
+          <button
+            v-else
+            type="button"
+            class="admin-action-btn draw-btn"
+            :disabled="savingDraw"
+            @click="unlockDraw"
+          >
+            {{ savingDraw ? "Unlocking..." : "Unlock Draw" }}
           </button>
         </div>
 
@@ -880,10 +1287,16 @@ onUnmounted(() => {
             <div v-show="isGroupExpanded(group.id)" class="group-body">
               <ul class="group-players">
                 <li v-for="player in group.players" :key="player.id">
-                  <span class="player-name">{{ player.fullName }}</span>
-                  <span class="rating">{{
-                    Math.round(player.currentRating)
-                  }}</span>
+                  <span class="player-name">
+                    {{ player.fullName }}
+                    <span v-if="player.advanced" class="advanced-badge"
+                      >Advanced</span
+                    >
+                  </span>
+                  <span class="standing"
+                    >{{ player.wins }}-{{ player.losses }}</span
+                  >
+                  <span class="rating">{{ ratingLabel(player) }}</span>
                 </li>
               </ul>
 
@@ -1012,41 +1425,193 @@ onUnmounted(() => {
         <h2>Participants</h2>
 
         <div class="participants-actions">
-          <p class="participants-count">
+          <p v-if="isDoublesFormat" class="participants-count">
+            {{ teams.length }} {{ teams.length === 1 ? "team" : "teams" }}
+            formed
+          </p>
+          <p v-else class="participants-count">
             {{ participants.length }}
             {{ participants.length === 1 ? "player" : "players" }} joined
           </p>
 
-          <button
-            v-if="currentPlayer && !isParticipant"
-            type="button"
-            class="join-btn"
-            :disabled="joiningTournament"
-            @click="joinTournament"
-          >
-            {{ joiningTournament ? "Joining..." : "Join Tournament" }}
-          </button>
-
-          <button
-            v-else-if="currentPlayer && isParticipant"
-            type="button"
-            class="leave-btn"
-            :disabled="leavingTournament"
-            @click="leaveTournament"
-          >
-            {{ leavingTournament ? "Leaving..." : "Leave Tournament" }}
-          </button>
-
-          <p v-else class="participants-hint">
-            Sign in with a player profile to join this tournament.
-          </p>
+          <template v-if="!isDoublesFormat">
+            <p v-if="isTournamentFinished" class="participants-hint">
+              This tournament is finished — sign-ups are closed.
+            </p>
+            <button
+              v-else-if="currentPlayer && !isParticipant"
+              type="button"
+              class="join-btn"
+              :disabled="joiningTournament"
+              @click="joinTournament"
+            >
+              {{ joiningTournament ? "Joining..." : "Join Tournament" }}
+            </button>
+            <button
+              v-else-if="currentPlayer && isParticipant"
+              type="button"
+              class="leave-btn"
+              :disabled="leavingTournament"
+              @click="leaveTournament"
+            >
+              {{ leavingTournament ? "Leaving..." : "Leave Tournament" }}
+            </button>
+            <p v-else class="participants-hint">
+              Sign in with a player profile to join this tournament.
+            </p>
+          </template>
         </div>
 
         <p v-if="participantError" class="match-error">
           {{ participantError }}
         </p>
 
-        <ul v-if="participants.length > 0" class="participants-list">
+        <!-- Doubles: partner up -->
+        <div v-if="isDoublesFormat" class="team-up-card">
+          <p v-if="!currentPlayer" class="participants-hint">
+            Sign in with a player profile to team up for this tournament.
+          </p>
+          <p v-else-if="isTournamentFinished" class="participants-hint">
+            This tournament is finished — sign-ups are closed.
+          </p>
+
+          <template v-else-if="myTeam">
+            <p class="team-status">
+              You're teamed up with <strong>{{ myPartnerName }}</strong> — team
+              rating {{ ratingLabel(myTeam) }}.
+            </p>
+            <button
+              type="button"
+              class="leave-btn"
+              :disabled="leavingTeam"
+              @click="leaveMyTeam"
+            >
+              {{ leavingTeam ? "Leaving..." : "Leave Team" }}
+            </button>
+          </template>
+
+          <template v-else-if="outgoingInvite">
+            <p class="team-status">
+              Invite sent to
+              <strong>{{ outgoingInvite.toPlayerName }}</strong> — waiting for a
+              response.
+            </p>
+            <button
+              type="button"
+              class="leave-btn"
+              :disabled="respondingInviteId === outgoingInvite.id"
+              @click="cancelMyInvite"
+            >
+              {{
+                respondingInviteId === outgoingInvite.id
+                  ? "Cancelling..."
+                  : "Cancel Invite"
+              }}
+            </button>
+          </template>
+
+          <template v-else>
+            <div v-if="incomingInvites.length > 0" class="incoming-invites">
+              <div
+                v-for="inv in incomingInvites"
+                :key="inv.id"
+                class="invite-row"
+              >
+                <span
+                  ><strong>{{ inv.fromPlayerName }}</strong> wants to team up
+                  with you</span
+                >
+                <div class="invite-actions">
+                  <button
+                    type="button"
+                    class="join-btn"
+                    :disabled="respondingInviteId === inv.id"
+                    @click="respondToInvite(inv, true)"
+                  >
+                    Accept
+                  </button>
+                  <button
+                    type="button"
+                    class="leave-btn"
+                    :disabled="respondingInviteId === inv.id"
+                    @click="respondToInvite(inv, false)"
+                  >
+                    Decline
+                  </button>
+                </div>
+              </div>
+            </div>
+
+            <div class="partner-picker">
+              <select v-model="selectedPartnerId">
+                <option value="">Choose a partner…</option>
+                <option
+                  v-for="p in eligiblePartnersList"
+                  :key="p.id"
+                  :value="p.id"
+                >
+                  {{ p.fullName }}
+                </option>
+              </select>
+              <button
+                type="button"
+                class="join-btn"
+                :disabled="!selectedPartnerId || sendingInvite"
+                @click="sendPartnerInvite"
+              >
+                {{ sendingInvite ? "Sending..." : "Send Invite" }}
+              </button>
+            </div>
+            <p
+              v-if="eligiblePartnersList.length === 0"
+              class="participants-hint"
+            >
+              No available partners right now.
+            </p>
+          </template>
+
+          <p v-if="teamError" class="match-error">{{ teamError }}</p>
+        </div>
+
+        <!-- Doubles: team list -->
+        <ul
+          v-if="isDoublesFormat && teams.length > 0"
+          class="participants-list"
+        >
+          <li
+            v-for="team in teams"
+            :key="team.id"
+            class="participant-row"
+            :class="{ 'is-you': myTeamId === team.id }"
+          >
+            <span class="participant-avatar participant-avatar-fallback">
+              {{ (team.teamName || "?").charAt(0).toUpperCase() }}
+            </span>
+            <span class="participant-name"
+              >{{ team.teamName }}
+              <span class="rating">{{ Math.round(team.teamRating) }}</span>
+            </span>
+            <span v-if="myTeamId === team.id" class="you-badge">You</span>
+            <button
+              v-if="isAdmin"
+              type="button"
+              class="remove-participant-btn"
+              :disabled="removingTeamId === team.id"
+              @click="removeTeam(team)"
+            >
+              {{ removingTeamId === team.id ? "Removing..." : "Remove" }}
+            </button>
+          </li>
+        </ul>
+        <p v-else-if="isDoublesFormat" class="participants-empty">
+          No teams formed yet.
+        </p>
+
+        <!-- Singles: participant list -->
+        <ul
+          v-if="!isDoublesFormat && participants.length > 0"
+          class="participants-list"
+        >
           <li
             v-for="participant in participants"
             :key="participant.id"
@@ -1056,8 +1621,8 @@ onUnmounted(() => {
             }"
           >
             <img
-              v-if="participant.playerPhotoUrl"
-              :src="participant.playerPhotoUrl"
+              v-if="participantPhoto(participant)"
+              :src="participantPhoto(participant)"
               :alt="participant.playerName"
               class="participant-avatar"
             />
@@ -1070,10 +1635,22 @@ onUnmounted(() => {
               class="you-badge"
               >You</span
             >
+            <button
+              v-if="isAdmin"
+              type="button"
+              class="remove-participant-btn"
+              :disabled="removingParticipantId === participant.id"
+              @click="removeParticipant(participant)"
+            >
+              {{
+                removingParticipantId === participant.id
+                  ? "Removing..."
+                  : "Remove"
+              }}
+            </button>
           </li>
         </ul>
-
-        <p v-else class="participants-empty">
+        <p v-else-if="!isDoublesFormat" class="participants-empty">
           No one has joined yet. Be the first!
         </p>
       </div>
@@ -1107,7 +1684,7 @@ onUnmounted(() => {
             >
               <h3>{{ round.name }}</h3>
               <div class="matches">
-                <template v-for="m in round.matches" :key="m.match">
+                <template v-for="m in round.matches" :key="m.id">
                   <div
                     v-if="!m.player1 || !m.player2"
                     class="match-row bracket-match-row"
@@ -1347,6 +1924,12 @@ onUnmounted(() => {
   border: 1px solid rgba(255, 255, 255, 0.12);
 }
 
+.status-pill.locked {
+  color: #6be0a3;
+  background: rgba(107, 224, 163, 0.1);
+  border: 1px solid rgba(107, 224, 163, 0.3);
+}
+
 .admin-action-btn {
   flex-shrink: 0;
   border-radius: 6px;
@@ -1387,6 +1970,12 @@ onUnmounted(() => {
   background: transparent;
   border-color: #d9534f;
   color: #ff8585;
+}
+
+.draw-btn {
+  background: transparent;
+  border-color: rgba(255, 255, 255, 0.15);
+  color: #b8b8b8;
 }
 
 .admin-error {
@@ -1558,6 +2147,30 @@ onUnmounted(() => {
 .player-name {
   color: #e8e8e8;
   flex: 1;
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.advanced-badge {
+  flex-shrink: 0;
+  font-size: 0.65rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.3px;
+  color: #6be0a3;
+  background: rgba(107, 224, 163, 0.12);
+  border: 1px solid rgba(107, 224, 163, 0.3);
+  border-radius: 999px;
+  padding: 0.1rem 0.5rem;
+}
+
+.standing {
+  color: #777;
+  font-size: 0.8rem;
+  font-variant-numeric: tabular-nums;
+  margin-left: 0.5rem;
+  flex-shrink: 0;
 }
 
 .rating {
@@ -1867,8 +2480,104 @@ onUnmounted(() => {
   padding: 0.15rem 0.5rem;
 }
 
+.remove-participant-btn {
+  flex-shrink: 0;
+  background: transparent;
+  border: 1px solid rgba(240, 131, 131, 0.4);
+  color: #f08383;
+  border-radius: 999px;
+  padding: 0.2rem 0.65rem;
+  font-size: 0.7rem;
+  font-weight: 700;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.remove-participant-btn:not(:disabled):hover {
+  background: rgba(240, 131, 131, 0.1);
+  border-color: #f08383;
+}
+
+.remove-participant-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
 .participants-empty {
   color: #888;
+  font-size: 0.9rem;
+}
+
+/* Doubles: partner up */
+.team-up-card {
+  background: rgba(255, 255, 255, 0.02);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 10px;
+  padding: 1.2rem;
+  margin-bottom: 1.2rem;
+  max-width: 480px;
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+
+.team-status {
+  color: #d8d8d8;
+  font-size: 0.9rem;
+  margin: 0;
+}
+
+.team-status strong {
+  color: #f4f7fb;
+}
+
+.incoming-invites {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.invite-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  flex-wrap: wrap;
+  background: rgba(255, 255, 255, 0.03);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 8px;
+  padding: 0.6rem 0.8rem;
+}
+
+.invite-row span {
+  color: #d8d8d8;
+  font-size: 0.85rem;
+}
+
+.invite-row strong {
+  color: #f4f7fb;
+}
+
+.invite-actions {
+  display: flex;
+  gap: 0.5rem;
+  flex-shrink: 0;
+}
+
+.partner-picker {
+  display: flex;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+}
+
+.partner-picker select {
+  flex: 1;
+  min-width: 180px;
+  background: #0d0e10;
+  color: #f0f0f1;
+  border: 1px solid #2f3136;
+  border-radius: 7px;
+  padding: 0.5rem 0.7rem;
   font-size: 0.9rem;
 }
 

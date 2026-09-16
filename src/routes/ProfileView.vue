@@ -10,6 +10,7 @@ import {
   where,
   orderBy,
 } from "firebase/firestore";
+import { uploadPlayerPhoto } from "../firebaseHelpers";
 
 const user = ref(auth.currentUser);
 const player = ref(null);
@@ -81,8 +82,11 @@ onMounted(() => {
           return {
             id: d.id,
             rating: data.rating,
+            previousRating: data.previousRating ?? null,
+            delta: typeof data.delta === "number" ? data.delta : null,
             date: toDate(data.recordedAt),
-            tournamentId: data.tournamentId,
+            tournamentId: data.tournamentId ?? d.id,
+            tournamentName: data.tournamentName || null,
           };
         });
       } catch (e) {
@@ -110,7 +114,9 @@ onMounted(() => {
 });
 
 const isVerified = computed(() => player.value !== null);
-const displayPhotoUrl = computed(() => player.value?.profilePhotoUrl || registrationPhotoUrl.value);
+const displayPhotoUrl = computed(
+  () => player.value?.profilePhotoUrl || registrationPhotoUrl.value,
+);
 
 const statusMessage = computed(() => {
   if (isVerified.value) return null;
@@ -128,17 +134,27 @@ const currentTier = computed(() => tierFor(currentRating.value));
 
 const peakRating = computed(() => {
   if (ratingHistory.value.length === 0) return currentRating.value;
-  return Math.max(...ratingHistory.value.map((h) => h.rating), currentRating.value ?? 0);
+  return Math.max(
+    ...ratingHistory.value.map((h) => h.rating),
+    currentRating.value ?? 0,
+  );
 });
 
 const tournamentsPlayed = computed(() => ratingHistory.value.length);
 
+// The change from the most recent tournament. Prefers the delta recorded
+// with the entry so a player's very first tournament still shows one.
 const ratingDelta = computed(() => {
-  if (ratingHistory.value.length < 2) return null;
-  const last = ratingHistory.value[ratingHistory.value.length - 1];
-  const prev = ratingHistory.value[ratingHistory.value.length - 2];
-  return last.rating - prev.rating;
+  const history = ratingHistory.value;
+  if (history.length === 0) return null;
+  const last = history[history.length - 1];
+  if (typeof last.delta === "number") return last.delta;
+  if (history.length < 2) return null;
+  return last.rating - history[history.length - 2].rating;
 });
+
+// Newest first for the list under the chart.
+const recentTournaments = computed(() => [...ratingHistory.value].reverse());
 
 // --- Chart geometry (plain SVG, no chart library needed) ---
 const CHART_W = 560;
@@ -175,7 +191,9 @@ const chartPoints = computed(() => {
 
 const linePath = computed(() => {
   if (chartPoints.value.length < 2) return "";
-  return chartPoints.value.map((p, i) => `${i === 0 ? "M" : "L"} ${p.x.toFixed(1)},${p.y.toFixed(1)}`).join(" ");
+  return chartPoints.value
+    .map((p, i) => `${i === 0 ? "M" : "L"} ${p.x.toFixed(1)},${p.y.toFixed(1)}`)
+    .join(" ");
 });
 
 const areaPath = computed(() => {
@@ -193,7 +211,38 @@ function formatMonthYear(date) {
 
 function formatFull(date) {
   if (!date) return "";
-  return date.toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" });
+  return date.toLocaleDateString("en-US", {
+    month: "short",
+    day: "numeric",
+    year: "numeric",
+  });
+}
+
+// --- Profile photo upload ---
+const photoInput = ref(null);
+const uploadingPhoto = ref(false);
+const photoError = ref("");
+
+function pickPhoto() {
+  photoInput.value?.click();
+}
+
+async function onPhotoSelected(event) {
+  const file = event.target.files?.[0];
+  event.target.value = "";
+  if (!file || !playerId.value) return;
+
+  uploadingPhoto.value = true;
+  photoError.value = "";
+  try {
+    const url = await uploadPlayerPhoto(file, playerId.value);
+    // Reflect immediately rather than waiting on a reload.
+    player.value = { ...player.value, profilePhotoUrl: url };
+  } catch (e) {
+    photoError.value = e.message || "Unable to upload photo.";
+  } finally {
+    uploadingPhoto.value = false;
+  }
 }
 </script>
 
@@ -209,22 +258,45 @@ function formatFull(date) {
       <template v-else>
         <div class="card hero">
           <div class="hero-top">
-            <img
-              v-if="displayPhotoUrl"
-              :src="displayPhotoUrl"
-              alt="profile"
-              class="profile-photo"
-            />
-            <div v-else class="profile-placeholder">No photo</div>
+            <div class="photo-wrap">
+              <img
+                v-if="displayPhotoUrl"
+                :src="displayPhotoUrl"
+                alt="profile"
+                class="profile-photo"
+              />
+              <div v-else class="profile-placeholder">No photo</div>
+
+              <button
+                v-if="isVerified"
+                type="button"
+                class="photo-edit-btn"
+                :disabled="uploadingPhoto"
+                @click="pickPhoto"
+              >
+                {{ uploadingPhoto ? "Uploading…" : "Edit" }}
+              </button>
+              <input
+                ref="photoInput"
+                type="file"
+                accept="image/*"
+                class="photo-input-native"
+                @change="onPhotoSelected"
+              />
+            </div>
 
             <div class="hero-meta">
               <div class="name-row">
-                <p class="name">{{ player?.displayName || user.email }}</p>
-                <span class="status-badge" :class="isVerified ? 'verified' : 'unverified'">
+                <p class="name">{{ player?.fullName || user.email }}</p>
+                <span
+                  class="status-badge"
+                  :class="isVerified ? 'verified' : 'unverified'"
+                >
                   {{ isVerified ? "Verified" : "Unverified" }}
                 </span>
               </div>
-              <p class="email" v-if="player?.displayName">{{ user.email }}</p>
+              <p class="email" v-if="player?.fullName">{{ user.email }}</p>
+              <p v-if="photoError" class="photo-error">{{ photoError }}</p>
             </div>
           </div>
 
@@ -236,19 +308,33 @@ function formatFull(date) {
             <div class="rating-block">
               <span class="rating-kicker">Current Rating</span>
               <div class="rating-row">
-                <span class="rating-number">{{ currentRating !== null ? currentRating.toLocaleString() : "—" }}</span>
-                <span v-if="ratingDelta !== null" class="rating-delta" :class="ratingDelta >= 0 ? 'up' : 'down'">
+                <span class="rating-number">{{
+                  currentRating !== null ? currentRating.toLocaleString() : "—"
+                }}</span>
+                <span
+                  v-if="ratingDelta !== null"
+                  class="rating-delta"
+                  :class="ratingDelta >= 0 ? 'up' : 'down'"
+                >
                   {{ ratingDelta >= 0 ? "▲" : "▼" }} {{ Math.abs(ratingDelta) }}
                 </span>
               </div>
-              <span class="tier-badge" :style="{ color: currentTier.color, borderColor: currentTier.color }">
+              <span
+                class="tier-badge"
+                :style="{
+                  color: currentTier.color,
+                  borderColor: currentTier.color,
+                }"
+              >
                 {{ currentTier.label }}
               </span>
             </div>
 
             <div class="stats-row">
               <div class="stat-box">
-                <span class="stat-value">{{ peakRating !== null ? peakRating.toLocaleString() : "—" }}</span>
+                <span class="stat-value">{{
+                  peakRating !== null ? peakRating.toLocaleString() : "—"
+                }}</span>
                 <span class="stat-label">Peak Rating</span>
               </div>
               <div class="stat-box">
@@ -256,7 +342,9 @@ function formatFull(date) {
                 <span class="stat-label">Tournaments</span>
               </div>
               <div class="stat-box">
-                <span class="stat-value">{{ (player?.totalPoints ?? 0).toLocaleString() }}</span>
+                <span class="stat-value">{{
+                  (player?.totalPoints ?? 0).toLocaleString()
+                }}</span>
                 <span class="stat-label">Points</span>
               </div>
             </div>
@@ -269,7 +357,8 @@ function formatFull(date) {
           <div v-if="loadingHistory" class="placeholder-text">Loading…</div>
 
           <div v-else-if="ratingHistory.length === 0" class="placeholder-text">
-            No tournaments recorded yet — your rating history will appear here after your first confirmed tournament.
+            No tournaments recorded yet — your rating history will appear here
+            after your first confirmed tournament.
           </div>
 
           <div v-else class="chart-wrap">
@@ -291,15 +380,38 @@ function formatFull(date) {
                 class="gridline"
               />
 
-              <text :x="PAD.left - 8" :y="PAD.top + 4" class="axis-label" text-anchor="end">
+              <text
+                :x="PAD.left - 8"
+                :y="PAD.top + 4"
+                class="axis-label"
+                text-anchor="end"
+              >
                 {{ Math.round(chartRange.max) }}
               </text>
-              <text :x="PAD.left - 8" :y="PAD.top + plotH + 4" class="axis-label" text-anchor="end">
+              <text
+                :x="PAD.left - 8"
+                :y="PAD.top + plotH + 4"
+                class="axis-label"
+                text-anchor="end"
+              >
                 {{ Math.round(chartRange.min) }}
               </text>
 
-              <path v-if="areaPath" :d="areaPath" fill="url(#ratingFill)" stroke="none" />
-              <path v-if="linePath" :d="linePath" fill="none" stroke="#e0551f" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" />
+              <path
+                v-if="areaPath"
+                :d="areaPath"
+                fill="url(#ratingFill)"
+                stroke="none"
+              />
+              <path
+                v-if="linePath"
+                :d="linePath"
+                fill="none"
+                stroke="#e0551f"
+                stroke-width="2.5"
+                stroke-linecap="round"
+                stroke-linejoin="round"
+              />
 
               <circle
                 v-for="p in chartPoints"
@@ -314,7 +426,12 @@ function formatFull(date) {
                 <title>{{ formatFull(p.date) }} — {{ p.rating }}</title>
               </circle>
 
-              <text :x="chartPoints[0]?.x" :y="CHART_H - 6" class="axis-label" text-anchor="start">
+              <text
+                :x="chartPoints[0]?.x"
+                :y="CHART_H - 6"
+                class="axis-label"
+                text-anchor="start"
+              >
                 {{ formatMonthYear(chartPoints[0]?.date) }}
               </text>
               <text
@@ -327,6 +444,23 @@ function formatFull(date) {
               </text>
             </svg>
           </div>
+
+          <ul v-if="ratingHistory.length > 0" class="history-list">
+            <li v-for="entry in recentTournaments" :key="entry.id">
+              <span class="history-name">{{
+                entry.tournamentName || "Tournament"
+              }}</span>
+              <span class="history-date">{{ formatFull(entry.date) }}</span>
+              <span
+                v-if="entry.delta !== null"
+                class="history-delta"
+                :class="entry.delta >= 0 ? 'up' : 'down'"
+              >
+                {{ entry.delta >= 0 ? "+" : "−" }}{{ Math.abs(entry.delta) }}
+              </span>
+              <span class="history-rating">{{ entry.rating }}</span>
+            </li>
+          </ul>
         </div>
       </template>
     </div>
@@ -381,13 +515,17 @@ h1 {
   align-items: center;
 }
 
+.photo-wrap {
+  position: relative;
+  flex-shrink: 0;
+}
+
 .profile-photo {
   width: 84px;
   height: 84px;
   object-fit: cover;
   border-radius: 10px;
   border: 1px solid #2a2b2f;
-  flex-shrink: 0;
 }
 
 .profile-placeholder {
@@ -402,8 +540,45 @@ h1 {
   border-radius: 10px;
   font-size: 0.8rem;
   font-weight: 600;
-  flex-shrink: 0;
   text-align: center;
+}
+
+.photo-edit-btn {
+  position: absolute;
+  bottom: -0.5rem;
+  right: -0.5rem;
+  background: #e0551f;
+  color: #fff;
+  border: 2px solid #111214;
+  border-radius: 999px;
+  padding: 0.25rem 0.6rem;
+  font-size: 0.7rem;
+  font-weight: 700;
+  cursor: pointer;
+  transition: background 0.15s ease;
+}
+
+.photo-edit-btn:hover:not(:disabled) {
+  background: #ef632c;
+}
+
+.photo-edit-btn:disabled {
+  opacity: 0.7;
+  cursor: not-allowed;
+}
+
+.photo-input-native {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+}
+
+.photo-error {
+  margin: 0.3rem 0 0;
+  color: #f08383;
+  font-size: 0.8rem;
 }
 
 .hero-meta {
@@ -581,5 +756,60 @@ h1 {
 .axis-label {
   fill: #6f747c;
   font-size: 10px;
+}
+
+/* Tournament-by-tournament breakdown under the chart */
+.history-list {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.history-list li {
+  display: flex;
+  align-items: baseline;
+  gap: 0.6rem;
+  padding: 0.6rem 0;
+  border-top: 1px solid #2a2b2f;
+  font-size: 0.875rem;
+}
+
+.history-name {
+  color: #e5e6e8;
+  font-weight: 600;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.history-date {
+  color: #6f747c;
+  font-size: 0.8rem;
+  flex: 1;
+  white-space: nowrap;
+}
+
+.history-delta {
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+}
+
+.history-delta.up {
+  color: #4ade80;
+}
+
+.history-delta.down {
+  color: #f08383;
+}
+
+.history-rating {
+  color: #f5f5f5;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  min-width: 3ch;
+  text-align: right;
 }
 </style>

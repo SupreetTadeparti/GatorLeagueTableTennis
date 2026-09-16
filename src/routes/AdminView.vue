@@ -1,7 +1,8 @@
 <script setup>
-import { ref, onMounted } from "vue";
+import { ref, onMounted, computed, watch } from "vue";
 import { db } from "../firebase";
 import {
+  addDoc,
   collection,
   query,
   where,
@@ -14,12 +15,22 @@ import {
 } from "firebase/firestore";
 import { uploadWinnerPhoto } from "../firebaseHelpers";
 import { createPlayerFromRegistration } from "../firebaseHelpers";
+import {
+  applyAvailability,
+  applyTournamentRatings,
+  revertAvailability,
+  revertTournamentRatings,
+  sortTournamentsChronologically,
+  toJsDate,
+} from "../ratings";
+import { applyTournamentPoints } from "../points";
 
 // tabs: pending registrations + admin management + placeholders for future
 const tabs = [
   { id: "pending", label: "Pending Registrations" },
   { id: "admins", label: "Manage Admins" },
   { id: "tournament", label: "Tournament Management" },
+  { id: "ratings", label: "Tournament Ratings" },
   { id: "awards", label: "Season Awards" },
   { id: "players", label: "Player Management" },
 ];
@@ -98,6 +109,7 @@ onMounted(() => {
   loadPending();
   loadAdmins();
   loadTournaments();
+  loadPlayers();
 });
 
 // tournaments state for tournament management
@@ -119,6 +131,72 @@ async function loadTournaments() {
     console.error("loadTournaments", e);
   } finally {
     loadingTournaments.value = false;
+  }
+}
+
+// New tournament creation. Weeks alternate singles/doubles by whatever
+// format is picked here — the rest of the app (draw, ratings) branches on
+// this field.
+const newTournamentName = ref("");
+const newTournamentDate = ref("");
+const newTournamentFormat = ref("singles");
+const creatingTournament = ref(false);
+
+async function createTournament() {
+  if (!newTournamentDate.value) {
+    alert("Pick a date for the new tournament.");
+    return;
+  }
+  creatingTournament.value = true;
+  try {
+    const docRef = await addDoc(collection(db, "tournaments"), {
+      name: newTournamentName.value || null,
+      date: newTournamentDate.value,
+      format: newTournamentFormat.value,
+      status: "active",
+      finishedAt: null,
+      ratingsAppliedAt: null,
+      winnerPhotoUrl: null,
+      seasonId: null,
+      createdAt: serverTimestamp(),
+    });
+    newTournamentName.value = "";
+    newTournamentDate.value = "";
+    newTournamentFormat.value = "singles";
+    await loadTournaments();
+    selectedTournament.value = docRef.id;
+    alert("Tournament created.");
+  } catch (e) {
+    console.error(e);
+    alert("Create failed: " + (e.message || e));
+  } finally {
+    creatingTournament.value = false;
+  }
+}
+
+const selectedTournamentFormat = ref("singles");
+const savingFormat = ref(false);
+
+// Keep the format editor in sync with whichever tournament is selected.
+watch(selectedTournament, (id) => {
+  const t = tournaments.value.find((tt) => tt.id === id);
+  selectedTournamentFormat.value = t?.format || "singles";
+});
+
+async function saveFormat() {
+  if (!selectedTournament.value) return;
+  savingFormat.value = true;
+  try {
+    await updateDoc(doc(db, "tournaments", selectedTournament.value), {
+      format: selectedTournamentFormat.value,
+    });
+    await loadTournaments();
+    alert("Format saved.");
+  } catch (e) {
+    console.error(e);
+    alert("Save failed: " + (e.message || e));
+  } finally {
+    savingFormat.value = false;
   }
 }
 
@@ -160,6 +238,245 @@ async function saveLiveLink() {
     savingLive.value = false;
   }
 }
+
+// ---------------------------------------------------------------------
+// Tournament Ratings: revert or recompute any tournament's rating
+// changes. All the logic — rating math, Firestore writes, and the
+// ordering rule that keeps starting ratings correct — lives in
+// src/ratings.js, shared with TournamentView.vue.
+// ---------------------------------------------------------------------
+
+function formatTournamentDate(value) {
+  const d = toJsDate(value);
+  if (!d) return "No date set";
+  return d.toLocaleDateString(undefined, {
+    year: "numeric",
+    month: "short",
+    day: "numeric",
+  });
+}
+
+// Newest tournament first, so "revert the last 3" reads top-to-bottom.
+const ratingTournaments = computed(() =>
+  sortTournamentsChronologically(tournaments.value).reverse(),
+);
+
+// Whether each action is legal right now, and why not when it isn't.
+// Ratings must be applied oldest-first and reverted newest-first: that's
+// what guarantees a player's current rating is always the rating they
+// carry into the next unrated tournament. Recomputing out of order is how
+// tournaments after a reverted one ended up with stale starting ratings.
+function revertCheck(tournament) {
+  return revertAvailability(tournament, tournaments.value);
+}
+
+function applyCheck(tournament) {
+  return applyAvailability(tournament, tournaments.value);
+}
+
+// Per-tournament busy/error state, keyed by tournament ID.
+const ratingActionState = ref({});
+
+function ratingState(tournamentId) {
+  return ratingActionState.value[tournamentId] || {};
+}
+
+function setRatingActionState(tournamentId, patch) {
+  ratingActionState.value = {
+    ...ratingActionState.value,
+    [tournamentId]: {
+      ...(ratingActionState.value[tournamentId] || {}),
+      ...patch,
+    },
+  };
+}
+
+// Applies this tournament's rating changes from its submitted matches.
+// Only offered when this tournament is next in line chronologically, so
+// every player's starting rating is their post-previous-tournament
+// rating — including right after a revert, which is the case that used to
+// go wrong.
+async function recomputeTournamentRatings(tournament) {
+  const tournamentId = tournament.id;
+  const label = tournament.name || tournamentId;
+
+  const availability = applyCheck(tournament);
+  if (!availability.allowed) {
+    setRatingActionState(tournamentId, { error: availability.reason });
+    return;
+  }
+
+  const confirmed = window.confirm(
+    `Apply ratings for "${label}" from its submitted matches? Each participant's current rating is used as their starting rating, and the result is written to their rating history.`,
+  );
+  if (!confirmed) return;
+
+  setRatingActionState(tournamentId, { recomputing: true, error: "" });
+  try {
+    await applyTournamentRatings(tournamentId);
+    await loadTournaments();
+    await loadPlayers();
+  } catch (e) {
+    setRatingActionState(tournamentId, {
+      error: e.message || "Unable to apply ratings for this tournament.",
+    });
+  } finally {
+    setRatingActionState(tournamentId, { recomputing: false });
+  }
+}
+
+// Restores every player touched by this tournament back to the rating
+// they held before it. Only offered when no later tournament still has
+// ratings applied, so ratings always come off newest to oldest.
+async function revertRatingsFor(tournament) {
+  const tournamentId = tournament.id;
+  const label = tournament.name || tournamentId;
+
+  const availability = revertCheck(tournament);
+  if (!availability.allowed) {
+    setRatingActionState(tournamentId, { error: availability.reason });
+    return;
+  }
+
+  const confirmed = window.confirm(
+    `Revert rating changes from "${label}"? Every affected player's rating goes back to what it was before this tournament, and it drops off their rating history.`,
+  );
+  if (!confirmed) return;
+
+  setRatingActionState(tournamentId, { reverting: true, error: "" });
+  try {
+    await revertTournamentRatings(tournamentId);
+    await loadTournaments();
+    await loadPlayers();
+  } catch (e) {
+    setRatingActionState(tournamentId, {
+      error: e.message || "Unable to revert ratings for this tournament.",
+    });
+  } finally {
+    setRatingActionState(tournamentId, { reverting: false });
+  }
+}
+
+// Points have no ordering rule like ratings do -- each tournament's
+// contribution is tracked independently (see src/points.js), so the only
+// requirement is that the tournament is finished.
+function pointsCheck(tournament) {
+  if (!tournament.finishedAt) {
+    return {
+      allowed: false,
+      reason: "Finish this tournament before applying points.",
+    };
+  }
+  return { allowed: true, reason: "" };
+}
+
+async function applyPointsFor(tournament) {
+  const tournamentId = tournament.id;
+  const label = tournament.name || tournamentId;
+
+  const availability = pointsCheck(tournament);
+  if (!availability.allowed) {
+    setRatingActionState(tournamentId, { pointsError: availability.reason });
+    return;
+  }
+
+  const confirmed = window.confirm(
+    `Apply points for "${label}" from its submitted matches? This adds to (or, if it's been applied before, corrects) each participant's season total. There's no revert button for points — fix a player's total directly in Player Management if you need to undo it.`,
+  );
+  if (!confirmed) return;
+
+  setRatingActionState(tournamentId, { applyingPoints: true, pointsError: "" });
+  try {
+    await applyTournamentPoints(tournamentId);
+    await loadTournaments();
+    await loadPlayers();
+  } catch (e) {
+    setRatingActionState(tournamentId, {
+      pointsError: e.message || "Unable to apply points for this tournament.",
+    });
+  } finally {
+    setRatingActionState(tournamentId, { applyingPoints: false });
+  }
+}
+
+// player management state
+const players = ref([]);
+const loadingPlayers = ref(false);
+const playerSearch = ref("");
+const editingPlayerId = ref(null);
+const editForm = ref({
+  fullName: "",
+  email: "",
+  currentRating: 0,
+  totalPoints: 0,
+});
+const savingPlayer = ref(false);
+
+async function loadPlayers() {
+  loadingPlayers.value = true;
+  try {
+    const snaps = await getDocs(collection(db, "players"));
+    players.value = snaps.docs.map((d) => ({ id: d.id, ...d.data() }));
+  } catch (e) {
+    console.error("loadPlayers", e);
+  } finally {
+    loadingPlayers.value = false;
+  }
+}
+
+const filteredPlayers = computed(() => {
+  const q = playerSearch.value.trim().toLowerCase();
+  if (!q) return players.value;
+  return players.value.filter(
+    (p) =>
+      (p.fullName || "").toLowerCase().includes(q) ||
+      (p.email || "").toLowerCase().includes(q),
+  );
+});
+
+function startEdit(player) {
+  editingPlayerId.value = player.id;
+  editForm.value = {
+    fullName: player.fullName || "",
+    email: player.email || "",
+    currentRating: player.currentRating ?? 0,
+    totalPoints: player.totalPoints ?? 0,
+  };
+}
+
+function cancelEdit() {
+  editingPlayerId.value = null;
+}
+
+async function saveEdit(playerId) {
+  savingPlayer.value = true;
+  try {
+    await updateDoc(doc(db, "players", playerId), {
+      fullName: editForm.value.fullName,
+      email: editForm.value.email,
+      currentRating: Number(editForm.value.currentRating),
+      totalPoints: Number(editForm.value.totalPoints),
+    });
+    await loadPlayers();
+    editingPlayerId.value = null;
+  } catch (e) {
+    console.error(e);
+    alert("Save failed: " + (e.message || e));
+  } finally {
+    savingPlayer.value = false;
+  }
+}
+
+async function resetRating(player) {
+  if (!confirm(`Reset ${player.fullName}'s rating to 1000?`)) return;
+  try {
+    await updateDoc(doc(db, "players", player.id), { currentRating: 1000 });
+    await loadPlayers();
+  } catch (e) {
+    console.error(e);
+    alert("Reset failed: " + (e.message || e));
+  }
+}
 </script>
 
 <template>
@@ -184,7 +501,10 @@ async function saveLiveLink() {
           <h2>Pending Registrations</h2>
 
           <div v-if="loadingPending" class="empty-state">Loading…</div>
-          <div v-if="!loadingPending && pending.length === 0" class="empty-state">
+          <div
+            v-if="!loadingPending && pending.length === 0"
+            class="empty-state"
+          >
             No pending registrations.
           </div>
 
@@ -203,13 +523,19 @@ async function saveLiveLink() {
                 <div class="meta">Rating: {{ r.submittedRating }}</div>
                 <div class="meta">
                   Payment: {{ r.claimPaymentMethod }}
-                  <span v-if="r.claimPaymentDate"> &middot; {{ r.claimPaymentDate }}</span>
+                  <span v-if="r.claimPaymentDate">
+                    &middot; {{ r.claimPaymentDate }}</span
+                  >
                 </div>
-                <div v-if="r.paymentNote" class="meta note">{{ r.paymentNote }}</div>
+                <div v-if="r.paymentNote" class="meta note">
+                  {{ r.paymentNote }}
+                </div>
               </div>
 
               <div class="actions">
-                <button class="btn-primary" @click="approve(r.id)">Approve</button>
+                <button class="btn-primary" @click="approve(r.id)">
+                  Approve
+                </button>
                 <button class="btn-danger" @click="reject(r.id)">Reject</button>
               </div>
             </div>
@@ -237,25 +563,91 @@ async function saveLiveLink() {
           <h2>Tournament Management</h2>
 
           <div class="card">
-            <div class="field">
-              <label for="tournamentSelect">Select tournament</label>
-              <select id="tournamentSelect" v-model="selectedTournament">
-                <option value="">-- select --</option>
-                <option v-for="t in tournaments" :key="t.id" :value="t.id">
-                  {{ t.name || t.id }}
-                </option>
-              </select>
+            <div class="subsection">
+              <h3>Create Tournament</h3>
+              <div class="field">
+                <label for="newTournamentName">Name</label>
+                <input
+                  id="newTournamentName"
+                  v-model="newTournamentName"
+                  placeholder="Week 5 – Doubles"
+                />
+              </div>
+              <div class="field">
+                <label for="newTournamentDate">Date</label>
+                <input
+                  id="newTournamentDate"
+                  v-model="newTournamentDate"
+                  type="date"
+                />
+              </div>
+              <div class="field">
+                <label for="newTournamentFormat">Format</label>
+                <select id="newTournamentFormat" v-model="newTournamentFormat">
+                  <option value="singles">Singles</option>
+                  <option value="doubles">Doubles</option>
+                </select>
+              </div>
+              <button
+                class="btn-primary"
+                :disabled="creatingTournament"
+                @click="createTournament"
+              >
+                {{ creatingTournament ? "Creating…" : "Create Tournament" }}
+              </button>
+            </div>
+
+            <div class="subsection">
+              <div class="field">
+                <label for="tournamentSelect">Select tournament</label>
+                <select id="tournamentSelect" v-model="selectedTournament">
+                  <option value="">-- select --</option>
+                  <option v-for="t in tournaments" :key="t.id" :value="t.id">
+                    {{ t.name || t.id }}
+                  </option>
+                </select>
+              </div>
             </div>
 
             <template v-if="selectedTournament">
+              <div class="subsection">
+                <h3>Format</h3>
+                <div class="field">
+                  <label for="selectedTournamentFormat"
+                    >Singles or doubles</label
+                  >
+                  <select
+                    id="selectedTournamentFormat"
+                    v-model="selectedTournamentFormat"
+                  >
+                    <option value="singles">Singles</option>
+                    <option value="doubles">Doubles</option>
+                  </select>
+                </div>
+                <button
+                  class="btn-primary"
+                  :disabled="savingFormat"
+                  @click="saveFormat"
+                >
+                  {{ savingFormat ? "Saving…" : "Save Format" }}
+                </button>
+              </div>
+
               <div class="subsection">
                 <h3>Upload Winner Photo</h3>
                 <div class="field">
                   <label class="file-input" for="winnerPhoto">
                     <span class="file-button">Browse&hellip;</span>
-                    <span class="file-name">{{ selectedFile ? selectedFile.name : "No file selected." }}</span>
+                    <span class="file-name">{{
+                      selectedFile ? selectedFile.name : "No file selected."
+                    }}</span>
                   </label>
-                  <input id="winnerPhoto" class="file-native" type="file" @change="onFileChange" />
+                  <input
+                    id="winnerPhoto"
+                    class="file-native"
+                    type="file"
+                    @change="onFileChange"
+                  />
                 </div>
                 <button
                   class="btn-primary"
@@ -270,17 +662,147 @@ async function saveLiveLink() {
                 <h3>Livestream</h3>
                 <div class="field">
                   <label for="liveUrl">Livestream URL</label>
-                  <input id="liveUrl" v-model="liveUrl" placeholder="https://..." />
+                  <input
+                    id="liveUrl"
+                    v-model="liveUrl"
+                    placeholder="https://..."
+                  />
                 </div>
                 <label class="checkbox-field">
                   <input type="checkbox" v-model="isLive" />
                   Show on homepage (live)
                 </label>
-                <button class="btn-primary" @click="saveLiveLink" :disabled="savingLive">
+                <button
+                  class="btn-primary"
+                  @click="saveLiveLink"
+                  :disabled="savingLive"
+                >
                   {{ savingLive ? "Saving…" : "Save Livestream" }}
                 </button>
               </div>
             </template>
+          </div>
+        </section>
+
+        <section v-if="active === 'ratings'">
+          <h2>Tournament Ratings</h2>
+
+          <p class="placeholder-text ratings-intro">
+            Ratings come off newest first and go back on oldest first, and the
+            buttons only unlock for the tournament that's next in line. To fix
+            ratings from several tournaments back, revert down from the most
+            recent through the one you're fixing, then apply them back up one at
+            a time. Each tournament starts from the ratings the one before it
+            finished with, so nothing downstream is left stale.
+          </p>
+          <p class="placeholder-text ratings-intro">
+            Points don't have that ordering rule — any finished tournament can
+            have points applied any time, and re-applying after fixing a result
+            corrects each player's total rather than double-counting. There's no
+            revert button for points; edit a player's total directly under
+            Player Management if you need to undo one.
+          </p>
+
+          <div v-if="loadingTournaments" class="empty-state">Loading…</div>
+          <div
+            v-if="!loadingTournaments && ratingTournaments.length === 0"
+            class="empty-state"
+          >
+            No tournaments found.
+          </div>
+
+          <div class="list">
+            <div
+              v-for="t in ratingTournaments"
+              :key="t.id"
+              class="reg-card rating-card"
+            >
+              <div class="body">
+                <strong>{{ t.name || t.id }}</strong>
+                <div class="meta">{{ formatTournamentDate(t.date) }}</div>
+                <div class="meta status-row">
+                  <span class="status-chip" :class="{ on: !!t.finishedAt }">{{
+                    t.finishedAt ? "Finished" : "Not finished"
+                  }}</span>
+                  <span
+                    class="status-chip"
+                    :class="{ on: !!t.ratingsAppliedAt }"
+                    >{{
+                      t.ratingsAppliedAt
+                        ? "Ratings applied"
+                        : "Ratings not applied"
+                    }}</span
+                  >
+                  <span
+                    class="status-chip"
+                    :class="{ on: !!t.pointsAppliedAt }"
+                    >{{
+                      t.pointsAppliedAt
+                        ? "Points applied"
+                        : "Points not applied"
+                    }}</span
+                  >
+                </div>
+                <p
+                  v-if="!revertCheck(t).allowed && !applyCheck(t).allowed"
+                  class="meta blocked-reason"
+                >
+                  {{
+                    t.ratingsAppliedAt
+                      ? revertCheck(t).reason
+                      : applyCheck(t).reason
+                  }}
+                </p>
+                <p v-if="ratingState(t.id).error" class="rating-error">
+                  {{ ratingState(t.id).error }}
+                </p>
+                <p v-if="ratingState(t.id).pointsError" class="rating-error">
+                  {{ ratingState(t.id).pointsError }}
+                </p>
+              </div>
+
+              <div class="actions rating-actions">
+                <span class="actions-label">Ratings</span>
+                <button
+                  class="btn-danger"
+                  :disabled="
+                    !revertCheck(t).allowed || ratingState(t.id).reverting
+                  "
+                  :title="revertCheck(t).reason"
+                  @click="revertRatingsFor(t)"
+                >
+                  {{ ratingState(t.id).reverting ? "Reverting…" : "Revert" }}
+                </button>
+                <button
+                  class="btn-primary"
+                  :disabled="
+                    !applyCheck(t).allowed || ratingState(t.id).recomputing
+                  "
+                  :title="applyCheck(t).reason"
+                  @click="recomputeTournamentRatings(t)"
+                >
+                  {{ ratingState(t.id).recomputing ? "Applying…" : "Apply" }}
+                </button>
+
+                <span class="actions-label">Points</span>
+                <button
+                  class="btn-primary"
+                  :disabled="
+                    !pointsCheck(t).allowed || ratingState(t.id).applyingPoints
+                  "
+                  :title="pointsCheck(t).reason"
+                  @click="applyPointsFor(t)"
+                >
+                  {{
+                    ratingState(t.id).applyingPoints
+                      ? "Applying…"
+                      : t.pointsAppliedAt
+                        ? "Recompute"
+                        : "Apply"
+                  }}
+                </button>
+              </div>
+            </div>
           </div>
         </section>
 
@@ -295,10 +817,82 @@ async function saveLiveLink() {
 
         <section v-if="active === 'players'">
           <h2>Player Management</h2>
-          <div class="card">
-            <p class="placeholder-text">
-              Placeholder — edit player profiles, reset ratings, or suspend accounts.
-            </p>
+
+          <div class="admin-form">
+            <input
+              v-model="playerSearch"
+              placeholder="Search by name or email…"
+            />
+          </div>
+
+          <div v-if="loadingPlayers" class="empty-state">Loading…</div>
+          <div
+            v-if="!loadingPlayers && filteredPlayers.length === 0"
+            class="empty-state"
+          >
+            No players found.
+          </div>
+
+          <div class="list">
+            <div v-for="p in filteredPlayers" :key="p.id" class="reg-card">
+              <img
+                v-if="p.profilePhotoUrl"
+                :src="p.profilePhotoUrl"
+                alt="photo"
+                class="thumb"
+              />
+              <div v-else class="thumb thumb-placeholder">?</div>
+
+              <template v-if="editingPlayerId === p.id">
+                <div class="body edit-body">
+                  <div class="field">
+                    <label>Full name</label>
+                    <input v-model="editForm.fullName" />
+                  </div>
+                  <div class="field">
+                    <label>Email</label>
+                    <input v-model="editForm.email" type="email" />
+                  </div>
+                  <div class="field">
+                    <label>Rating</label>
+                    <input v-model="editForm.currentRating" type="number" />
+                  </div>
+                  <div class="field">
+                    <label>Total points</label>
+                    <input v-model="editForm.totalPoints" type="number" />
+                  </div>
+                </div>
+                <div class="actions">
+                  <button
+                    class="btn-primary"
+                    @click="saveEdit(p.id)"
+                    :disabled="savingPlayer"
+                  >
+                    {{ savingPlayer ? "Saving…" : "Save" }}
+                  </button>
+                  <button class="btn-danger" @click="cancelEdit">Cancel</button>
+                </div>
+              </template>
+
+              <template v-else>
+                <div class="body">
+                  <strong>{{ p.fullName }}</strong>
+                  <div class="meta">{{ p.email }}</div>
+                  <div class="meta">
+                    Rating: {{ p.currentRating }} &middot; Points:
+                    {{ p.totalPoints }}
+                  </div>
+                </div>
+                <div class="actions">
+                  <button class="btn-primary" @click="startEdit(p)">
+                    Edit
+                  </button>
+                  <button class="btn-danger" @click="resetRating(p)">
+                    Reset Rating
+                  </button>
+                </div>
+              </template>
+            </div>
           </div>
         </section>
       </main>
@@ -355,7 +949,9 @@ async function saveLiveLink() {
   font-size: 0.9rem;
   font-weight: 600;
   border-left: 3px solid transparent;
-  transition: background 0.15s ease, color 0.15s ease;
+  transition:
+    background 0.15s ease,
+    color 0.15s ease;
 }
 
 .admin-nav li:hover {
@@ -513,6 +1109,79 @@ async function saveLiveLink() {
   margin: 0;
 }
 
+.ratings-intro {
+  margin-bottom: 1.1rem;
+  line-height: 1.5;
+}
+
+/* Tournament Ratings */
+.rating-card {
+  align-items: flex-start;
+}
+
+.status-row {
+  display: flex;
+  gap: 0.4rem;
+  flex-wrap: wrap;
+  margin-top: 0.35rem;
+}
+
+.status-chip {
+  font-size: 0.72rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.3px;
+  color: #6f747c;
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid #2a2b2f;
+  border-radius: 999px;
+  padding: 0.2rem 0.6rem;
+}
+
+.status-chip.on {
+  color: #6be0a3;
+  background: rgba(107, 224, 163, 0.1);
+  border-color: rgba(107, 224, 163, 0.3);
+}
+
+.rating-error {
+  color: #f08383;
+  font-size: 0.82rem;
+  margin: 0.5rem 0 0;
+}
+
+.blocked-reason {
+  color: #6f747c;
+  font-style: italic;
+  margin-top: 0.4rem;
+}
+
+.rating-actions {
+  flex-direction: column;
+  align-items: stretch;
+  min-width: 110px;
+  gap: 0.4rem;
+}
+
+.actions-label {
+  color: #6f747c;
+  font-size: 0.68rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+  margin-top: 0.3rem;
+}
+
+.actions-label:first-child {
+  margin-top: 0;
+}
+
+.rating-actions .btn-primary,
+.rating-actions .btn-danger {
+  width: 100%;
+  text-align: center;
+}
+
 .field {
   display: flex;
   flex-direction: column;
@@ -545,6 +1214,8 @@ label {
 input[type="text"],
 input[type="email"],
 input[type="url"],
+input[type="number"],
+input[type="date"],
 input:not([type]),
 select {
   background: #0d0e10;
@@ -619,7 +1290,10 @@ input::placeholder {
   font-size: 0.85rem;
   font-weight: 700;
   cursor: pointer;
-  transition: background 0.15s ease, opacity 0.15s ease, border-color 0.15s ease;
+  transition:
+    background 0.15s ease,
+    opacity 0.15s ease,
+    border-color 0.15s ease;
   white-space: nowrap;
 }
 
@@ -648,6 +1322,21 @@ input::placeholder {
   border-color: #f08383;
 }
 
+.btn-danger:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.edit-body {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.edit-body .field {
+  gap: 0.2rem;
+}
+
 @media (max-width: 720px) {
   .admin-shell {
     flex-direction: column;
@@ -664,6 +1353,10 @@ input::placeholder {
   .actions {
     width: 100%;
     justify-content: flex-end;
+  }
+
+  .rating-actions {
+    flex-direction: row;
   }
 }
 </style>
