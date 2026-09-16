@@ -11,12 +11,15 @@ import {
   orderBy,
 } from "firebase/firestore";
 import { uploadPlayerPhoto } from "../firebaseHelpers";
+import { toJsDate } from "../dates";
+import { rankPlayers } from "../standings";
 
 const user = ref(auth.currentUser);
 const player = ref(null);
 const playerId = ref(null);
 const ratingHistory = ref([]);
 const loadingHistory = ref(false);
+const playerRank = ref(null);
 
 // Set once player.value is confirmed null and we've checked the registrations
 // collection: 'pending', 'rejected', or null (never registered at all).
@@ -37,18 +40,13 @@ function tierFor(rating) {
   return TIERS.find((t) => rating >= t.min) ?? TIERS[TIERS.length - 1];
 }
 
-function toDate(ts) {
-  if (!ts) return null;
-  if (typeof ts.toDate === "function") return ts.toDate();
-  return new Date(ts);
-}
-
 onMounted(() => {
   auth.onAuthStateChanged(async (u) => {
     user.value = u;
     player.value = null;
     playerId.value = null;
     ratingHistory.value = [];
+    playerRank.value = null;
     registrationStatus.value = null;
     registrationPhotoUrl.value = null;
 
@@ -71,24 +69,53 @@ onMounted(() => {
     if (playerId.value) {
       loadingHistory.value = true;
       try {
-        const historySnap = await getDocs(
-          query(
-            collection(db, "players", playerId.value, "ratingHistory"),
-            orderBy("recordedAt", "asc"),
+        const [historySnap, tournamentSnaps, playersSnap] = await Promise.all([
+          getDocs(
+            query(
+              collection(db, "players", playerId.value, "ratingHistory"),
+              orderBy("recordedAt", "asc"),
+            ),
           ),
-        );
+          getDocs(collection(db, "tournaments")),
+          getDocs(collection(db, "players")),
+        ]);
+
+        const tournamentDateById = {};
+        tournamentSnaps.docs.forEach((d) => {
+          tournamentDateById[d.id] = d.data().date;
+        });
+
         ratingHistory.value = historySnap.docs.map((d) => {
           const data = d.data();
+          const tournamentId = data.tournamentId ?? d.id;
+          // Prefer the tournament's own date, re-parsed with the
+          // day-first-aware rule in dates.js, over the frozen `recordedAt`
+          // snapshot — entries recorded before that rule existed have the
+          // wrong instant baked into recordedAt, and re-deriving from the
+          // source date self-heals the display without needing ratings to
+          // be recomputed.
+          const date =
+            toJsDate(tournamentDateById[tournamentId]) ??
+            toJsDate(data.recordedAt);
           return {
             id: d.id,
             rating: data.rating,
             previousRating: data.previousRating ?? null,
             delta: typeof data.delta === "number" ? data.delta : null,
-            date: toDate(data.recordedAt),
-            tournamentId: data.tournamentId ?? d.id,
+            date,
+            tournamentId,
             tournamentName: data.tournamentName || null,
           };
         });
+
+        const allPlayers = playersSnap.docs.map((pd) => ({
+          id: pd.id,
+          ...pd.data(),
+        }));
+        const idx = rankPlayers(allPlayers).findIndex(
+          (p) => p.id === playerId.value,
+        );
+        playerRank.value = idx === -1 ? null : idx + 1;
       } catch (e) {
         console.error("Failed to load rating history", e);
       } finally {
@@ -132,6 +159,15 @@ const statusMessage = computed(() => {
 const currentRating = computed(() => player.value?.currentRating ?? null);
 const currentTier = computed(() => tierFor(currentRating.value));
 
+// Only worth calling out on the profile card when it's actually a
+// leaderboard-worthy rank — anything past top 3 is just noise here (the
+// full leaderboard is what Standings is for).
+const rankBadge = computed(() =>
+  playerRank.value !== null && playerRank.value <= 3
+    ? `#${playerRank.value}`
+    : null,
+);
+
 const peakRating = computed(() => {
   if (ratingHistory.value.length === 0) return currentRating.value;
   return Math.max(
@@ -163,8 +199,29 @@ const PAD = { top: 16, right: 14, bottom: 28, left: 42 };
 const plotW = CHART_W - PAD.left - PAD.right;
 const plotH = CHART_H - PAD.top - PAD.bottom;
 
+// The chart's own data series: the recorded history, plus a synthetic
+// leading point for the rating the player carried in *before* their first
+// tournament (every entry's own previousRating is otherwise redundant —
+// it's just the prior entry's rating — except for the very first one,
+// which is the only place that starting point exists).
+const chartSeries = computed(() => {
+  const history = ratingHistory.value;
+  if (history.length === 0) return [];
+  const first = history[0];
+  if (typeof first.previousRating !== "number") return history;
+  return [
+    {
+      id: "start",
+      rating: first.previousRating,
+      date: null,
+      isStart: true,
+    },
+    ...history,
+  ];
+});
+
 const chartRange = computed(() => {
-  const ratings = ratingHistory.value.map((h) => h.rating);
+  const ratings = chartSeries.value.map((h) => h.rating);
   if (ratings.length === 0) return { min: 0, max: 1 };
   let min = Math.min(...ratings);
   let max = Math.max(...ratings);
@@ -180,9 +237,10 @@ const chartRange = computed(() => {
 });
 
 const chartPoints = computed(() => {
-  const n = ratingHistory.value.length;
+  const series = chartSeries.value;
+  const n = series.length;
   const { min, max } = chartRange.value;
-  return ratingHistory.value.map((h, i) => {
+  return series.map((h, i) => {
     const x = n <= 1 ? PAD.left + plotW / 2 : PAD.left + (i / (n - 1)) * plotW;
     const y = PAD.top + plotH - ((h.rating - min) / (max - min || 1)) * plotH;
     return { ...h, x, y };
@@ -342,9 +400,12 @@ async function onPhotoSelected(event) {
                 <span class="stat-label">Tournaments</span>
               </div>
               <div class="stat-box">
-                <span class="stat-value">{{
-                  (player?.totalPoints ?? 0).toLocaleString()
-                }}</span>
+                <span class="stat-value points-value">
+                  {{ (player?.totalPoints ?? 0).toLocaleString() }}
+                  <span v-if="rankBadge" class="rank-badge">{{
+                    rankBadge
+                  }}</span>
+                </span>
                 <span class="stat-label">Points</span>
               </div>
             </div>
@@ -418,12 +479,15 @@ async function onPhotoSelected(event) {
                 :key="p.id"
                 :cx="p.x"
                 :cy="p.y"
-                r="4"
-                fill="#e0551f"
+                :r="p.isStart ? 3 : 4"
+                :fill="p.isStart ? '#6f747c' : '#e0551f'"
                 stroke="#111214"
                 stroke-width="2"
               >
-                <title>{{ formatFull(p.date) }} — {{ p.rating }}</title>
+                <title>
+                  {{ p.isStart ? "Starting rating" : formatFull(p.date) }} —
+                  {{ p.rating }}
+                </title>
               </circle>
 
               <text
@@ -432,7 +496,11 @@ async function onPhotoSelected(event) {
                 class="axis-label"
                 text-anchor="start"
               >
-                {{ formatMonthYear(chartPoints[0]?.date) }}
+                {{
+                  chartPoints[0]?.isStart
+                    ? "Start"
+                    : formatMonthYear(chartPoints[0]?.date)
+                }}
               </text>
               <text
                 :x="chartPoints[chartPoints.length - 1]?.x"
@@ -719,6 +787,21 @@ h1 {
 .stat-value {
   color: #f5f5f5;
   font-size: 1.3rem;
+  font-weight: 800;
+}
+
+.points-value {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+}
+
+.rank-badge {
+  background: linear-gradient(135deg, #ffb37a 0%, #e0551f 60%, #c93f10 100%);
+  color: #fff;
+  border-radius: 999px;
+  padding: 0.1rem 0.5rem;
+  font-size: 0.7rem;
   font-weight: 800;
 }
 

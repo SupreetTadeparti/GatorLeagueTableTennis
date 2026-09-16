@@ -19,7 +19,7 @@ const uploading = ref(false);
 const success = ref(null);
 const error = ref(null);
 
-const ZELLE_NUMBER = "352-756-2685";
+const ZELLE_EMAIL = "supreettadeparti@gmail.com";
 
 // Track auth state so we can skip email/password if the person is already signed in
 const currentUser = ref(null);
@@ -159,7 +159,7 @@ async function submit() {
         </div>
 
         <p v-if="claimPaymentMethod === 'zelle'" class="payment-hint">
-          Entry fee is <strong>$20</strong>. Send Zelle payment to <strong>{{ ZELLE_NUMBER }}</strong>
+          Entry fee is <strong>$20</strong>. Send Zelle payment to <strong>{{ ZELLE_EMAIL }}</strong>
         </p>
         <p v-else class="payment-hint">
           Entry fee is <strong>$20</strong>.

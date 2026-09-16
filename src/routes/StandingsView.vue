@@ -2,6 +2,7 @@
 import { ref, computed, onMounted } from "vue";
 import { collection, getDocs } from "firebase/firestore";
 import { db } from "../firebase";
+import { rankPlayers } from "../standings";
 
 const players = ref([]);
 const loading = ref(true);
@@ -22,17 +23,9 @@ async function loadPlayers() {
 }
 
 // Ranked by season points — that's what "standings" means here. Rating
-// is shown alongside as secondary context, not what the list is sorted
-// by.
-const ranked = computed(() =>
-  [...players.value]
-    .filter(
-      (p) =>
-        typeof p.totalPoints === "number" ||
-        typeof p.currentRating === "number",
-    )
-    .sort((a, b) => (b.totalPoints ?? 0) - (a.totalPoints ?? 0)),
-);
+// is shown alongside as secondary context, and also breaks ties when two
+// players are level on points.
+const ranked = computed(() => rankPlayers(players.value));
 
 function initial(name) {
   return (name || "?").charAt(0).toUpperCase();
