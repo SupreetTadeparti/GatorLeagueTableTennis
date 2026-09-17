@@ -188,6 +188,7 @@ function closeMenu() {
   display: flex;
   align-items: center;
   gap: 1rem;
+  z-index: 100;
 }
 
 .nav-links {
