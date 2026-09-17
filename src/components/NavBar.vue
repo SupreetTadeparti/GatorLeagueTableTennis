@@ -128,6 +128,7 @@ function closeMenu() {
   border-radius: 0.5em;
   box-shadow: 0 10px 35px rgba(0, 0, 0, 0.35);
   backdrop-filter: blur(16px);
+  z-index: 100;
 }
 
 .brand {
@@ -188,7 +189,6 @@ function closeMenu() {
   display: flex;
   align-items: center;
   gap: 1rem;
-  z-index: 100;
 }
 
 .nav-links {
