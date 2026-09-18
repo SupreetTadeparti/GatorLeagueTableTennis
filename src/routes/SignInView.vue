@@ -1,7 +1,12 @@
 <script setup>
 import { ref } from "vue";
 import { auth } from "../firebase";
-import { signInWithEmailAndPassword, GoogleAuthProvider, signInWithPopup } from "firebase/auth";
+import {
+  signInWithEmailAndPassword,
+  GoogleAuthProvider,
+  signInWithPopup,
+  sendPasswordResetEmail,
+} from "firebase/auth";
 import { useRouter } from "vue-router";
 
 const router = useRouter();
@@ -9,6 +14,12 @@ const email = ref("");
 const password = ref("");
 const loading = ref(false);
 const error = ref(null);
+
+// Forgot-password state, kept separate from the sign-in error/loading so
+// a reset attempt never clobbers (or gets clobbered by) a sign-in attempt.
+const resetSending = ref(false);
+const resetError = ref(null);
+const resetSent = ref(false);
 
 async function signInEmail() {
   error.value = null;
@@ -36,6 +47,36 @@ async function signInGoogle() {
     loading.value = false;
   }
 }
+
+async function sendReset() {
+  resetError.value = null;
+  resetSent.value = false;
+
+  const target = email.value.trim();
+  if (!target) {
+    resetError.value = "Enter your email above first, then click \u201cForgot password?\u201d again.";
+    return;
+  }
+
+  resetSending.value = true;
+  try {
+    await sendPasswordResetEmail(auth, target);
+    // Always show success, even if the address isn't registered — this
+    // avoids leaking which emails have accounts.
+    resetSent.value = true;
+  } catch (e) {
+    // auth/invalid-email is the one case worth surfacing distinctly;
+    // everything else (including "user not found") still shows success
+    // for the same reason as above.
+    if (e.code === "auth/invalid-email") {
+      resetError.value = "That doesn't look like a valid email address.";
+    } else {
+      resetSent.value = true;
+    }
+  } finally {
+    resetSending.value = false;
+  }
+}
 </script>
 
 <template>
@@ -51,7 +92,17 @@ async function signInGoogle() {
         </div>
 
         <div class="field">
-          <label for="password">Password</label>
+          <div class="field-label-row">
+            <label for="password">Password</label>
+            <button
+              type="button"
+              class="forgot-link"
+              :disabled="resetSending"
+              @click="sendReset"
+            >
+              {{ resetSending ? "Sending…" : "Forgot password?" }}
+            </button>
+          </div>
           <input
             id="password"
             v-model="password"
@@ -60,6 +111,12 @@ async function signInGoogle() {
             autocomplete="current-password"
           />
         </div>
+
+        <p v-if="resetSent" class="status success">
+          If an account exists for that email, a reset link is on its way —
+          check your inbox.
+        </p>
+        <p v-if="resetError" class="status error">{{ resetError }}</p>
 
         <button class="submit-btn" @click="signInEmail" :disabled="loading || !email || !password">
           {{ loading ? "Signing in…" : "Sign In" }}
@@ -134,10 +191,36 @@ h2 {
   gap: 0.4rem;
 }
 
+.field-label-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+}
+
 label {
   color: #9ca3ae;
   font-size: 0.85rem;
   font-weight: 600;
+}
+
+.forgot-link {
+  background: transparent;
+  border: none;
+  padding: 0;
+  color: #6fa8ff;
+  font-size: 0.8rem;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.forgot-link:hover:not(:disabled) {
+  text-decoration: underline;
+}
+
+.forgot-link:disabled {
+  color: #5b5f66;
+  cursor: not-allowed;
 }
 
 input[type="email"],
@@ -237,6 +320,10 @@ input::placeholder {
   color: #f08383;
 }
 
+.status.success {
+  color: #6be0a3;
+}
+
 .switch-link {
   margin: 0;
   text-align: center;
@@ -254,3 +341,4 @@ input::placeholder {
   text-decoration: underline;
 }
 </style>
+
