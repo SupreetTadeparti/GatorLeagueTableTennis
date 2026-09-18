@@ -154,6 +154,7 @@ async function createTournament() {
       date: newTournamentDate.value,
       format: newTournamentFormat.value,
       status: "active",
+      startedAt: null,
       finishedAt: null,
       ratingsAppliedAt: null,
       winnerPhotoUrl: null,
